@@ -1,5 +1,5 @@
-idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS "."
-                       PRIV_REQUIRES esp_driver_i2c esp_driver_spi
-                                     esp_driver_gpio esp_driver_twai
-                                     esp_adc)
+idf_component_register(
+    SRCS "main.c" "max31865.c"
+    INCLUDE_DIRS "."
+    REQUIRES driver esp_adc
+)

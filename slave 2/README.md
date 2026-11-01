@@ -1,190 +1,298 @@
-# ESP32 Slave 2: ADS1113 ADC over CAN
+# ESP32 Slave 2 — ADS1113 CAN Telemetry
 
-An ESP32 node that measures one voltage with an **ADS1113 16-bit ADC** and sends it as a CAN frame every 100 ms. The same values are printed on the serial monitor.
+## Overview
 
-## Features
+Slave 2 is an ESP32-WROOM-32 based sensor node for measuring an analog input through an ADS1113 16-bit ADC and transmitting the measured data to the Master through the CAN bus.
 
-- 16-bit voltage measurement over I²C (62.5 µV per step)
-- 10 kΩ / 20 kΩ input divider, so inputs up to about 3.07 V can be measured
-- CAN (TWAI) output at 500 kbit/s on frame ID `0x200`
-- The program keeps running if the ADS1113 is missing, and reports the problem
+The node performs:
+
+1. ADS1113 ADC acquisition
+2. Voltage conversion
+3. External voltage-divider compensation
+4. CAN/TWAI initialization
+5. Periodic CAN transmission
+
+Slave 2 is part of the **ESP Multi Sensor** distributed Master–Slave CAN architecture.
+
+---
 
 ## Hardware
 
-| Part | Qty | Interface |
-|---|---:|---|
-| ESP32-WROOM-32 DevKit | 1 | n/a |
-| ADS1113 module | 1 | I²C |
-| 10 kΩ resistor | 1 | Input divider (top) |
-| 20 kΩ resistor | 1 | Input divider (bottom) |
-| 3.3 V CAN transceiver (for example SN65HVD230) | 1 | CAN |
-| 120 Ω resistors | 2 | CAN termination, one at each end of the bus |
+### ESP32
 
-## Pin Map
-
-| Function | GPIO |
-|---|---|
-| I²C SDA | 21 |
-| I²C SCL | 22 |
-| CAN TX | 5 |
-| CAN RX | 4 |
-
-Use the **GPIO labels** printed on your board, not physical header positions.
-
-## Wiring
+- ESP32-WROOM-32 DevKit
+- ESP-IDF v6.x
+- Built-in TWAI/CAN controller
 
 ### ADS1113
 
-| ADS1113 pin | Connection |
+- 16-bit ADC
+- I²C interface
+- I²C address: `0x48`
+- Differential measurement: `AIN0 - AIN1`
+
+---
+
+## Wiring
+
+### ADS1113 → ESP32
+
+| ADS1113 | ESP32 |
 |---|---|
-| VDD | 3V3 |
+| VDD | 3.3 V |
 | GND | GND |
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
-| ADDR | GND (I²C address `0x48`) |
-| AIN0 | Output of the voltage divider |
+| ADDR | GND |
 | AIN1 | GND |
-| ALRT / RDY | Not connected |
+| AIN0 | Voltage-divider output |
 
-The ADS1113 measures the difference between AIN0 and AIN1, so **AIN1 must be tied to GND**.
+The current firmware uses I²C at **400 kHz**.
 
-### Input voltage divider
+### Input Voltage Divider
 
 ```text
-INPUT ──[ 10 kΩ ]──┬── AIN0
-                   │
-                [ 20 kΩ ]
-                   │
-                  GND
+INPUT
+  │
+  │
+  └── 10 kΩ ──────┬────── AIN0
+                  │
+                 20 kΩ
+                  │
+                 GND
 ```
 
+The firmware compensates for the divider using:
+
 ```text
-V_ADC   = V_INPUT / 1.5
+V_ADC = V_INPUT / 1.5
+
 V_INPUT = V_ADC × 1.5
 ```
 
-The ADS1113 has a fixed input range of ±2.048 V, so the largest input you can measure is **2.048 × 1.5 = 3.072 V**. Keep the voltage at AIN0 between 0 and 2.048 V. Negative inputs are not supported.
+The maximum theoretical input corresponding to the ADS1113's ±2.048 V range is approximately 3.072 V with this divider.
 
-### CAN
+---
 
-| ESP32 | CAN transceiver |
+# CAN Communication
+
+Slave 2 communicates with the Master using the ESP32's built-in TWAI controller and an external CAN transceiver.
+
+### CAN wiring
+
+| ESP32 | CAN Transceiver |
 |---|---|
 | GPIO 5 | TXD |
 | GPIO 4 | RXD |
-| 3V3 | VCC (for a 3.3 V transceiver) |
+| 3.3 V | Logic supply |
 | GND | GND |
 
-Connect CANH and CANL to the bus, with a 120 Ω resistor at **each end of the bus**, not at every node.
-
-Use a **3.3 V** transceiver. A 5 V transceiver such as the TJA1050 outputs 5 V on RXD, which can damage the ESP32 pin unless you level-shift it.
-
-## ADS1113 Settings
-
-| Setting | Value |
-|---|---|
-| Input | AIN0 − AIN1 (differential) |
-| Full-scale range | ±2.048 V (fixed on the ADS1113) |
-| Resolution | 16 bits (1 LSB = 62.5 µV) |
-| Mode | Single-shot, one conversion per reading |
-| Data rate | 128 samples per second |
-| Comparator | Disabled |
-
-## CAN Frame
-
-One frame, standard 11-bit ID `0x200`, 8 bytes, 500 kbit/s, sent every 100 ms. Values are **little-endian** (low byte first).
-
-| Bytes | Content | Type |
-|---|---|---|
-| 0–1 | Raw ADC value | int16 |
-| 2–3 | Voltage at the ADS1113 pin, in mV | uint16 |
-| 4–5 | Original input voltage (divider reversed), in mV | uint16 |
-| 6–7 | Packet counter (wraps around at 65535) | uint16 |
-
-### Decoding values
-
-| Value | Conversion |
-|---|---|
-| Voltage at the ADC pin | `bytes 2–3 / 1000.0` gives V |
-| Input voltage | `bytes 4–5 / 1000.0` gives V |
-| Raw to volts | `raw × 0.0000625` gives the voltage at the ADC pin |
-
-Voltages at or below 0 V are sent as 0 in the CAN frame.
-
-### Choosing CAN IDs across slaves
-
-| Slave | CAN IDs | Byte order |
-|---|---|---|
-| Slave 1 | `0x100`–`0x102` | Big-endian |
-| **Slave 2** | **`0x200`** | **Little-endian** |
-| Slave 3 | `0x300`–`0x302` | Big-endian |
-
-Slave 2 uses a different byte order from Slaves 1 and 3. If one receiver decodes all slaves, decode this frame separately or change the byte order in `can_send_ads1113()`.
-
-## Serial Output
-
-One line every 100 ms:
+The CAN bus connects to:
 
 ```text
-RAW=12000 | ADC=0.750000 V | INPUT=1.125000 V | CAN=OK | CNT=42
+CANH
+CANL
 ```
 
-| Field | Meaning |
+Use **120 Ω termination at both physical ends of the CAN bus**.
+
+---
+
+## CAN Configuration
+
+| Parameter | Value |
 |---|---|
-| `RAW` | Raw 16-bit ADC value |
-| `ADC` | Voltage at the ADS1113 pin |
-| `INPUT` | Original input voltage, with the divider reversed |
-| `CAN` | `OK` if the frame was sent and acknowledged, otherwise `ERROR` |
-| `CNT` | Packet counter |
+| CAN bitrate | **500 kbit/s** |
+| CAN ID | **0x200** |
+| Frame type | Standard 11-bit |
+| Data length | 8 bytes |
+| Encoding | **Big-endian** |
+| Transmission interval | ~100 ms |
 
-## Software Requirements
+The firmware uses GPIO 5 for TX, GPIO 4 for RX and a 500000 bit/s bitrate.
 
-- ESP-IDF v5.5 or newer (the project builds on v6.0.2)
-- No extra libraries
+---
 
-## Project Structure
+# CAN Frame — ID 0x200
+
+Slave 2 uses one 8-byte CAN frame.
+
+### Big-endian payload
+
+| Byte | Data |
+|---:|---|
+| 0–1 | Raw ADC value |
+| 2–3 | ADC voltage in mV |
+| 4–5 | Original input voltage in mV |
+| 6–7 | Packet counter |
+
+All multi-byte values are transmitted **MSB first**.
+
+Example:
+
+```text
+Value = 0x1234
+
+Byte 0 = 0x12
+Byte 1 = 0x34
+```
+
+This was changed from the original little-endian implementation so that Slave 2 now uses the same CAN encoding convention as the other slaves.
+
+---
+
+## CAN Data Interpretation
+
+### Bytes 0–1 — Raw ADC
+
+Signed 16-bit ADC result.
+
+```text
+raw = (byte0 << 8) | byte1
+```
+
+### Bytes 2–3 — ADC Voltage
+
+Unsigned 16-bit value in millivolts.
+
+```text
+ADC_voltage_mV =
+    (byte2 << 8) | byte3
+```
+
+### Bytes 4–5 — Original Input Voltage
+
+Unsigned 16-bit value in millivolts.
+
+```text
+Input_voltage_mV =
+    (byte4 << 8) | byte5
+```
+
+### Bytes 6–7 — Packet Counter
+
+Unsigned 16-bit counter.
+
+```text
+counter =
+    (byte6 << 8) | byte7
+```
+
+The counter allows the Master to identify missing or repeated packets.
+
+---
+
+## CAN Architecture
+
+```text
+              SLAVE 2
+                 │
+        ┌────────▼────────┐
+        │     ADS1113     │
+        │   16-bit ADC    │
+        └────────┬────────┘
+                 │
+            ESP32-WROOM-32
+                 │
+          TWAI / CAN GPIO
+           TX = GPIO 5
+           RX = GPIO 4
+                 │
+          CAN Transceiver
+                 │
+              CANH/CANL
+                 │
+            Shared CAN Bus
+                 │
+              MASTER
+```
+
+---
+
+## Software Structure
 
 ```text
 slave 2/
+│
 ├── CMakeLists.txt
+├── sdkconfig
 ├── README.md
+│
 └── main/
     ├── CMakeLists.txt
     └── main.c
 ```
 
-**Top-level `CMakeLists.txt`**
+---
 
-```cmake
-cmake_minimum_required(VERSION 3.16)
-include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(esp_slave2)
-```
-
-The project name is only a label for the build output. Any name works.
-
-**`main/CMakeLists.txt`**
-
-```cmake
-idf_component_register(SRCS "main.c"
-                       INCLUDE_DIRS "."
-                       PRIV_REQUIRES esp_driver_i2c esp_driver_gpio
-                                     esp_driver_twai)
-```
-
-## Build and Flash
-
-```bash
-idf.py set-target esp32
-idf.py build
-idf.py -p <PORT> flash monitor
-```
-
-Replace `<PORT>` with your serial port (for example `COM5`). Press `Ctrl+]` to exit the monitor.
-
-## Expected Output at Startup
+## Main Program Flow
 
 ```text
-I2C initialized: SDA=21 SCL=22
+Start
+  │
+  ▼
+Initialize I²C
+  │
+  ▼
+Detect ADS1113
+  │
+  ▼
+Initialize CAN/TWAI
+  │
+  ▼
+Start measurement
+  │
+  ▼
+Read ADS1113
+  │
+  ▼
+Convert ADC → voltage
+  │
+  ▼
+Apply divider compensation
+  │
+  ▼
+Pack data in BIG-ENDIAN format
+  │
+  ▼
+Transmit CAN ID 0x200
+  │
+  ▼
+Increment packet counter
+  │
+  ▼
+Wait ~100 ms
+  │
+  └──────────────► Repeat
+```
+
+---
+
+## Dependencies
+
+`main/CMakeLists.txt` requires:
+
+```cmake
+idf_component_register(
+    SRCS "main.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_driver_i2c
+        esp_driver_gpio
+        esp_driver_twai
+)
+```
+
+---
+
+## Verification
+
+A successful startup should show:
+
+```text
+ESP32 SLAVE 2
+ADS1113 + CAN
+I2C initialized
 ADS1113 detected at 0x48
 CAN initialized
 CAN TX GPIO : 5
@@ -194,20 +302,24 @@ CAN ID      : 0x200
 System initialized
 ```
 
-## Troubleshooting
+Measurements are then periodically transmitted over CAN.
 
-| Problem | Likely cause |
-|---|---|
-| `ADS1113 NOT detected` | Check VDD, GND, SDA and SCL wires, and that ADDR is tied to GND for address `0x48` |
-| `ADS1113 read failed` every 500 ms | The ADS1113 is not responding. The same causes as above |
-| `RAW` stuck at 32767 | The input is above the range. Check the divider and keep the input under 3.07 V |
-| `RAW` drifts or is far from 0 with the input shorted | AIN1 is not tied to GND |
-| `RAW` negative | The input is below AIN1, or the wires are swapped |
-| `CAN=ERROR` on every line | No CAN transceiver, or no second node on the bus. Frames are only acknowledged when another node is connected |
-| Board does not boot with the CAN wires connected | GPIO 5 is a boot-strapping pin. Disconnect the CAN TX wire, power up, then reconnect |
+---
 
-## Notes
+## CAN Network Convention
 
-- Slave 2 waits for each CAN frame to be acknowledged, so with no other node on the bus the `CAN=ERROR` message appears straight away. The ADC readings are still correct.
-- The loop runs at about 10 Hz. Change the `vTaskDelay` at the end of `app_main()` to send faster or slower.
-- The ADS1113 has no gain setting. If you need a different input range, change the divider resistors.
+All ESP Multi Sensor slaves use:
+
+```text
+CAN bitrate: 500 kbit/s
+Standard 11-bit identifiers
+BIG-ENDIAN multi-byte data
+```
+
+Slave 2:
+
+```text
+0x200
+```
+
+This common encoding allows the Master to use one decoding method for all sensor nodes.
