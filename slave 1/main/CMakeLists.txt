@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c" "max31865.c"
+    SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_adc
+    REQUIRES esp_driver_gpio esp_driver_i2c esp_driver_spi esp_driver_twai esp_adc
 )
