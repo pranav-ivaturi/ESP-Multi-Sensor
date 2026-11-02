@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  ESP32 "SLAVE 2" - ADS1113 16-BIT ADC, SENT OVER CAN
+ *  ESP32 "SLAVE 2" - ADS1115 16-BIT ADC, SENT OVER CAN
  * ============================================================
  *
  *  Board : ESP32-WROOM-32 DevKit
@@ -8,30 +8,19 @@
  *
  *  main/CMakeLists.txt must contain:
  *
- *      idf_component_register(SRCS "main.c"
- *                             INCLUDE_DIRS "."
- *                             PRIV_REQUIRES esp_driver_i2c
- *                                           esp_driver_gpio
- *                                           esp_driver_twai)
+ *    idf_component_register(SRCS "main.c"
+ *                           INCLUDE_DIRS "."
+ *                           PRIV_REQUIRES esp_driver_i2c
+ *                                         esp_driver_gpio
+ *                                         esp_driver_twai)
  *
- *  WIRING
- *    ADS1113:  VDD -> 3V3, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
- *              ADDR -> GND (address 0x48)
- *              AIN1 -> GND (the ADS1113 measures AIN0 - AIN1)
- *              AIN0 -> divider output
+ *  WIRING (PCB Handles external components)
+ *    ADS1115 SDA -> GPIO 21 (Safe 3.3V logic levels)
+ *    ADS1115 SCL -> GPIO 22 (Safe 3.3V logic levels)
  *
- *    Input divider:
- *      INPUT ---- 10k ----+---- ADS1113 AIN0
- *                         |
- *                        20k
- *                         |
- *                        GND
- *
- *    CAN (needs an external 3.3 V CAN transceiver):
- *      GPIO 5 -> transceiver TXD
- *      GPIO 4 -> transceiver RXD
- *      CANH / CANL -> bus
- *      120 ohm termination at each END of the bus
+ *  CAN (needs an external 3.3 V CAN transceiver):
+ *    GPIO 5 -> transceiver TXD
+ *    GPIO 4 -> transceiver RXD
  *
  * ------------------------------------------------------------
  *  CAN FRAME 0x200
@@ -43,11 +32,8 @@
  *
  *      bytes 0-1  raw ADC value (int16)
  *      bytes 2-3  ADC pin voltage in mV (uint16)
- *      bytes 4-5  original input voltage in mV (uint16)
+ *      bytes 4-5  original input voltage in mV (uint16) - Same as ADC voltage now
  *      bytes 6-7  packet counter (uint16)
- *
- *  IMPORTANT:
- *    All ESP Multi Sensor slaves now use BIG-ENDIAN encoding.
  *
  * ============================================================
  */
@@ -88,53 +74,45 @@ static const char *TAG = "SLAVE_2";
 #define I2C_FREQUENCY           400000
 #define I2C_TIMEOUT_MS          100
 
-#define ADS1113_ADDRESS         0x48
+#define ADS1115_ADDRESS         0x48
 
 
 /* ============================================================
- * ADS1113 REGISTERS
+ * ADS1115 REGISTERS
  * ============================================================ */
 
-#define ADS1113_REG_CONVERSION  0x00
-#define ADS1113_REG_CONFIG      0x01
+#define ADS1115_REG_CONVERSION  0x00
+#define ADS1115_REG_CONFIG      0x01
 
 
 /* ============================================================
- * ADS1113 CONFIGURATION
+ * ADS1115 CONFIGURATION
  *
- * Differential input AIN0 - AIN1
- * Full scale = +/-2.048 V
+ * Single-ended input AIN0 (Internal GND Reference)
+ * Full scale = +/-4.096 V (Covers the 0-2.5V input requirement)
  * Single-shot conversion
  * 128 SPS
  * Comparator disabled
  * ============================================================ */
 
-#define ADS1113_CONFIG          0x8583
+#define ADS1115_CONFIG          0xC383
 
 
 /* ============================================================
- * ADS1113 SCALING
+ * ADS1115 SCALING
  *
- * Full scale = +/-2.048 V, 16 bits
+ * Full scale = +/-4.096 V, 16 bits
  *
- * 1 LSB = 2.048 / 32768
- *       = 0.0000625 V
- *       = 62.5 uV
+ * 1 LSB = 4.096 / 32768
+ *       = 0.000125 V
+ *       = 125 uV
  *
- * External voltage divider:
- *
- * V_ADC = V_INPUT * 20 / 30
- *       = V_INPUT / 1.5
- *
- * Therefore:
- *
- * V_INPUT = V_ADC * 1.5
- *
- * Maximum measurable input = 2.048 V * 1.5 = 3.072 V
+ * External hardware (PCB):
+ * No voltage divider used. Direct 1:1 input via 100-ohm resistor.
+ * Therefore, V_INPUT = V_ADC
  * ============================================================ */
 
-#define ADS1113_LSB_V           0.0000625f
-#define DIVIDER_RATIO           1.5f
+#define ADS1115_LSB_V           0.000125f
 
 
 /* ============================================================
@@ -146,7 +124,7 @@ static const char *TAG = "SLAVE_2";
 
 #define CAN_BITRATE             500000
 
-#define CAN_ID_ADS1113          0x200
+#define CAN_ID_ADS1115          0x200
 
 #define CAN_TX_QUEUE_DEPTH      5
 
@@ -175,7 +153,7 @@ static void i2c_init(void)
         .scl_io_num = I2C_SCL_GPIO,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
+        .flags.enable_internal_pullup = true, // Fine in parallel with PCB 10k pull-ups
     };
 
     ESP_ERROR_CHECK(
@@ -188,7 +166,7 @@ static void i2c_init(void)
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = ADS1113_ADDRESS,
+        .device_address = ADS1115_ADDRESS,
         .scl_speed_hz = I2C_FREQUENCY,
     };
 
@@ -210,45 +188,42 @@ static void i2c_init(void)
     );
 
 
-    /* Report whether the ADS1113 answers,
-       but keep running either way. */
-
     if (
         i2c_master_probe(
             i2c_bus,
-            ADS1113_ADDRESS,
+            ADS1115_ADDRESS,
             I2C_TIMEOUT_MS
         ) == ESP_OK
     )
     {
         ESP_LOGI(
             TAG,
-            "ADS1113 detected at 0x%02X",
-            ADS1113_ADDRESS
+            "ADS1115 detected at 0x%02X",
+            ADS1115_ADDRESS
         );
     }
     else
     {
         ESP_LOGE(
             TAG,
-            "ADS1113 NOT detected at 0x%02X - check wiring and ADDR pin",
-            ADS1113_ADDRESS
+            "ADS1115 NOT detected at 0x%02X - check wiring and ADDR pin",
+            ADS1115_ADDRESS
         );
     }
 }
 
 
 /* ============================================================
- * ADS1113 WRITE CONFIG REGISTER
+ * ADS1115 WRITE CONFIG REGISTER
  * ============================================================ */
 
-static esp_err_t ads1113_write_config(
+static esp_err_t ads1115_write_config(
     uint16_t config_value
 )
 {
     uint8_t data[3];
 
-    data[0] = ADS1113_REG_CONFIG;
+    data[0] = ADS1115_REG_CONFIG;
 
     data[1] =
         (uint8_t)(config_value >> 8);
@@ -267,15 +242,15 @@ static esp_err_t ads1113_write_config(
 
 
 /* ============================================================
- * ADS1113 READ CONVERSION
+ * ADS1115 READ CONVERSION
  * ============================================================ */
 
-static esp_err_t ads1113_read_conversion(
+static esp_err_t ads1115_read_conversion(
     int16_t *raw
 )
 {
     uint8_t reg =
-        ADS1113_REG_CONVERSION;
+        ADS1115_REG_CONVERSION;
 
     uint8_t data[2];
 
@@ -307,10 +282,10 @@ static esp_err_t ads1113_read_conversion(
 
 
 /* ============================================================
- * ADS1113 READ VOLTAGE
+ * ADS1115 READ VOLTAGE
  * ============================================================ */
 
-static esp_err_t ads1113_read_voltage(
+static esp_err_t ads1115_read_voltage(
     int16_t *raw,
     float *adc_voltage,
     float *input_voltage
@@ -318,86 +293,48 @@ static esp_err_t ads1113_read_voltage(
 {
     esp_err_t err;
 
-
-    /*
-     * Start a single conversion.
-     */
-
+    /* Start a single conversion. */
     err =
-        ads1113_write_config(
-            ADS1113_CONFIG
+        ads1115_write_config(
+            ADS1115_CONFIG
         );
-
 
     if (err != ESP_OK) {
         return err;
     }
 
-
-    /*
-     * At 128 SPS a conversion takes
-     * approximately 7.8 ms.
-     */
-
+    /* At 128 SPS a conversion takes approximately 7.8 ms. */
     vTaskDelay(
         pdMS_TO_TICKS(10)
     );
 
-
-    /*
-     * Read conversion result.
-     */
-
+    /* Read conversion result. */
     err =
-        ads1113_read_conversion(
+        ads1115_read_conversion(
             raw
         );
-
 
     if (err != ESP_OK) {
         return err;
     }
 
-
-    /*
-     * Convert raw ADC value to voltage.
-     */
-
+    /* Convert raw ADC value to voltage. */
     *adc_voltage =
         (float)(*raw) *
-        ADS1113_LSB_V;
+        ADS1115_LSB_V;
 
+    /* 1:1 mapping on the PCB */
+    *input_voltage = *adc_voltage;
 
-    /*
-     * Reverse the external voltage divider.
-     */
-
-    *input_voltage =
-        (*adc_voltage) *
-        DIVIDER_RATIO;
-
-
-    /*
-     * Prevent tiny negative values around zero.
-     */
-
+    /* Prevent tiny negative values around zero. */
     if (
         *adc_voltage < 0.0f &&
         *adc_voltage > -0.001f
     )
     {
         *adc_voltage = 0.0f;
-    }
-
-
-    if (
-        *input_voltage < 0.0f &&
-        *input_voltage > -0.001f
-    )
-    {
         *input_voltage = 0.0f;
     }
-
 
     return ESP_OK;
 }
@@ -460,7 +397,7 @@ static void can_init(void)
     ESP_LOGI(
         TAG,
         "CAN ID      : 0x%03X",
-        CAN_ID_ADS1113
+        CAN_ID_ADS1115
     );
 
     ESP_LOGI(
@@ -488,7 +425,7 @@ static void write_be16(
 
 
 /* ============================================================
- * SEND ADS1113 CAN FRAME
+ * SEND ADS1115 CAN FRAME
  *
  * CAN DATA - BIG-ENDIAN
  *
@@ -499,13 +436,13 @@ static void write_be16(
  *     ADC voltage in mV
  *
  * Byte 4-5:
- *     Original input voltage in mV
+ *     Original input voltage in mV (Same as ADC voltage now)
  *
  * Byte 6-7:
  *     Packet counter
  * ============================================================ */
 
-static esp_err_t can_send_ads1113(
+static esp_err_t can_send_ads1115(
     int16_t raw,
     float adc_voltage,
     float input_voltage,
@@ -516,10 +453,7 @@ static esp_err_t can_send_ads1113(
     uint16_t input_mv;
 
 
-    /*
-     * Convert ADC voltage to millivolts.
-     */
-
+    /* Convert ADC voltage to millivolts. */
     if (adc_voltage <= 0.0f)
     {
         adc_mv = 0;
@@ -537,11 +471,7 @@ static esp_err_t can_send_ads1113(
     }
 
 
-    /*
-     * Convert original input voltage
-     * to millivolts.
-     */
-
+    /* Convert input voltage to millivolts. */
     if (input_voltage <= 0.0f)
     {
         input_mv = 0;
@@ -559,64 +489,37 @@ static esp_err_t can_send_ads1113(
     }
 
 
-    /*
-     * 8-byte CAN payload.
-     *
-     * Static so it remains valid while
-     * the frame is queued.
-     */
-
+    /* 8-byte CAN payload. */
     static uint8_t data[8];
 
-
-    /*
-     * BIG-ENDIAN
-     *
-     * Raw ADC
-     */
-
+    /* BIG-ENDIAN Raw ADC */
     write_be16(
         &data[0],
         (uint16_t)raw
     );
 
-
-    /*
-     * ADC voltage in mV
-     */
-
+    /* ADC voltage in mV */
     write_be16(
         &data[2],
         adc_mv
     );
 
-
-    /*
-     * Original input voltage in mV
-     */
-
+    /* Original input voltage in mV */
     write_be16(
         &data[4],
         input_mv
     );
 
-
-    /*
-     * Packet counter
-     */
-
+    /* Packet counter */
     write_be16(
         &data[6],
         packet_counter
     );
 
 
-    /*
-     * Standard 11-bit CAN frame.
-     */
-
+    /* Standard 11-bit CAN frame. */
     twai_frame_t frame = {
-        .header.id = CAN_ID_ADS1113,
+        .header.id = CAN_ID_ADS1115,
         .header.ide = false,
 
         .buffer = data,
@@ -624,10 +527,7 @@ static esp_err_t can_send_ads1113(
     };
 
 
-    /*
-     * Queue CAN frame.
-     */
-
+    /* Queue CAN frame. */
     esp_err_t err =
         twai_node_transmit(
             can_node,
@@ -648,10 +548,7 @@ static esp_err_t can_send_ads1113(
     }
 
 
-    /*
-     * Wait until transmission completes.
-     */
-
+    /* Wait until transmission completes. */
     err =
         twai_node_transmit_wait_all_done(
             can_node,
@@ -693,7 +590,7 @@ void app_main(void)
 
     ESP_LOGI(
         TAG,
-        "ADS1113 + CAN"
+        "ADS1115 + CAN (SINGLE-ENDED AIN0)"
     );
 
     ESP_LOGI(
@@ -701,83 +598,49 @@ void app_main(void)
         "========================================"
     );
 
-
-    /* --------------------------------------------------------
-     * Initialize I2C
-     * -------------------------------------------------------- */
-
     i2c_init();
-
-
-    /* --------------------------------------------------------
-     * Initialize CAN
-     * -------------------------------------------------------- */
-
     can_init();
 
-
     int16_t raw = 0;
-
     float adc_voltage = 0.0f;
-
     float input_voltage = 0.0f;
-
     uint16_t packet_counter = 0;
-
 
     ESP_LOGI(
         TAG,
         "System initialized"
     );
 
-
-    /* --------------------------------------------------------
-     * Main measurement loop
-     * -------------------------------------------------------- */
-
     while (1)
     {
         esp_err_t adc_result =
-            ads1113_read_voltage(
+            ads1115_read_voltage(
                 &raw,
                 &adc_voltage,
                 &input_voltage
             );
 
-
         if (adc_result != ESP_OK)
         {
             ESP_LOGE(
                 TAG,
-                "ADS1113 read failed: %s",
+                "ADS1115 read failed: %s",
                 esp_err_to_name(adc_result)
             );
-
 
             vTaskDelay(
                 pdMS_TO_TICKS(500)
             );
-
             continue;
         }
 
-
-        /* ----------------------------------------------------
-         * Send measurement over CAN
-         * ---------------------------------------------------- */
-
         esp_err_t can_result =
-            can_send_ads1113(
+            can_send_ads1115(
                 raw,
                 adc_voltage,
                 input_voltage,
                 packet_counter
             );
-
-
-        /* ----------------------------------------------------
-         * Print measurement
-         * ---------------------------------------------------- */
 
         ESP_LOGI(
             TAG,
@@ -791,13 +654,7 @@ void app_main(void)
             packet_counter
         );
 
-
         packet_counter++;
-
-
-        /* ----------------------------------------------------
-         * Send every 100 ms
-         * ---------------------------------------------------- */
 
         vTaskDelay(
             pdMS_TO_TICKS(100)
