@@ -50,12 +50,18 @@ The two GY-906 modules share an address, which is fine because they are on separ
 
 ## Wiring
 
+### Sensor power
+
+Power both GY-906 modules, the VL53L0X, and the pressure sensor from their required external regulated rails in the system architecture. Do not use the ESP32 `3V3` pin or a GPIO as a sensor supply. All external-supply grounds must join ESP32 GND, and every ESP32 input must remain within the 0–3.3 V range.
+
+If an external sensor rail can remain on while the ESP32 is off, isolate or sequence the sensor signal lines to prevent back-powering through the ESP32 input pins.
+
 ### Bus 0: GY-906 #1 and VL53L0X
 
 | Module pin | ESP32 |
 |---|---|
-| VCC / VIN | 3V3 |
-| GND | GND |
+| VCC / VIN | External regulated sensor supply compatible with the module |
+| GND | Common ground |
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
 
@@ -65,8 +71,8 @@ Both modules connect to the same GPIO 21 and GPIO 22 lines. On the VL53L0X, leav
 
 | Module pin | ESP32 |
 |---|---|
-| VCC / VIN | 3V3 |
-| GND | GND |
+| VCC / VIN | External regulated sensor supply compatible with the module |
+| GND | Common ground |
 | SDA | GPIO 25 |
 | SCL | GPIO 26 |
 

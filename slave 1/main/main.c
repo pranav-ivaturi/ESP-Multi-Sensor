@@ -38,17 +38,22 @@
  * ------------------------------------------------------------
  *  WIRING
  * ------------------------------------------------------------
+ *  SENSOR POWER (external supply; not ESP32 3V3)
+ *    Power the IMU, Hall module, and MAX31865 boards from the external
+ *    regulated sensor supply shown in the system diagram.  Join its ground
+ *    to ESP32 GND.  This firmware never drives a GPIO as a sensor supply.
+ *
  *  IMU (ICM-42688, I2C)
- *    VCC -> 3V3        GND -> GND
+ *    VCC -> external 3.3 V sensor supply, GND -> common GND
  *    SDA -> GPIO 21    SCL -> GPIO 22
  *    AD0 -> GND  (address 0x68; tie to 3V3 for 0x69 and change ICM_ADDR)
  *
  *  Hall sensor (HW-484)
- *    +  -> 3V3         G  -> GND
+ *    +  -> external sensor supply, G -> common GND
  *    A0 -> GPIO 34     D0 -> GPIO 27
  *
  *  MAX31865 boards (both share the same SPI lines)
- *    VIN -> 3V3        GND -> GND
+ *    VIN -> external 3.3 V sensor supply, GND -> common GND
  *    CLK -> GPIO 18    SDI (MOSI) -> GPIO 23    SDO (MISO) -> GPIO 19
  *    CS of board 1 -> GPIO 15
  *    CS of board 2 -> GPIO 13

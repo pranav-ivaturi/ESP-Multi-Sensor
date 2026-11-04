@@ -42,12 +42,18 @@ Use the **GPIO labels** printed on your board, not physical header positions.
 
 ## Wiring
 
+### Sensor power
+
+Power the IMU, Hall module, and both MAX31865 boards from the external regulated sensor supply in the system architecture — **not** from the ESP32 `3V3` pin or a GPIO. Connect the external-supply ground to ESP32 GND. The firmware only reads sensor signals; it does not control sensor power.
+
+If the external sensor rail can remain on while the ESP32 is off, use level shifters, bus isolation, or suitable power sequencing so I²C/SPI/ADC signal pins cannot back-power the ESP32.
+
 ### ICM-42688 IMU
 
 | IMU pin | ESP32 |
 |---|---|
-| VCC | 3V3 |
-| GND | GND |
+| VCC | External regulated 3.3 V sensor supply |
+| GND | Common ground |
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
 | AD0 | GND (address `0x68`) |
@@ -58,19 +64,19 @@ If you tie AD0 to 3V3 the address becomes `0x69`, and you must change `ICM_ADDR`
 
 | Hall pin | ESP32 |
 |---|---|
-| + | 3V3 |
-| G | GND |
+| + | External sensor supply (3.3 V if no level shifting) |
+| G | Common ground |
 | A0 | GPIO 34 |
 | D0 | GPIO 27 |
 
-Powering it from 3.3 V keeps the analog output within the ESP32's ADC range.
+Use a 3.3 V external supply (or level-shift/divide its output) to keep the analog output within the ESP32's ADC range.
 
 ### MAX31865 boards (shared SPI)
 
 | MAX31865 pin | Board 1 → ESP32 | Board 2 → ESP32 |
 |---|---|---|
-| VIN | 3V3 | 3V3 |
-| GND | GND | GND |
+| VIN | External regulated 3.3 V sensor supply | External regulated 3.3 V sensor supply |
+| GND | Common ground | Common ground |
 | CLK | GPIO 18 | GPIO 18 |
 | SDI (MOSI) | GPIO 23 | GPIO 23 |
 | SDO (MISO) | GPIO 19 | GPIO 19 |

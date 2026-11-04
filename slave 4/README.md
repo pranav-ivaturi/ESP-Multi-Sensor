@@ -28,6 +28,12 @@ The existing sensor acquisition behavior has been retained. CAN communication wa
 - 2 × MAX31865 RTD interface boards
 - Analog Hall-effect sensor
 
+### Sensor power
+
+Power both MAX31865 boards and the Hall sensor from the external regulated sensor supply in the system architecture, not from the ESP32 `3V3` pin or a GPIO. Connect the external-supply ground to ESP32 GND. The firmware only reads the sensor interfaces and has no sensor-power control output.
+
+If the external sensor rail can remain on while the ESP32 is off, isolate or sequence the SPI/ADC signal lines to prevent back-powering through the ESP32 input pins.
+
 ---
 
 # PT100 / MAX31865 Wiring
@@ -36,8 +42,8 @@ Each MAX31865 uses an independent SPI bus.
 
 | MAX31865 | RTD #1 | RTD #2 |
 |---|---:|---:|
-| VIN | 3.3 V | 3.3 V |
-| GND | GND | GND |
+| VIN | External regulated 3.3 V sensor supply | External regulated 3.3 V sensor supply |
+| GND | Common ground | Common ground |
 | SCK | GPIO 18 | GPIO 14 |
 | MOSI / SDI | GPIO 23 | GPIO 13 |
 | MISO / SDO | GPIO 19 | GPIO 27 |
@@ -66,8 +72,8 @@ The MAX31865 devices are configured independently on SPI2 and SPI3.
 | Hall Sensor | ESP32 |
 |---|---|
 | OUT | GPIO 34 |
-| GND | GND |
-| VCC | Sensor supply |
+| GND | Common ground |
+| VCC | External supply required by the sensor |
 
 GPIO 34 is used as ADC1 channel 6.
 

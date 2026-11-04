@@ -14,13 +14,19 @@
  *                                           esp_driver_gpio
  *                                           esp_driver_twai)
  *
+ *  SENSOR POWER
+ *    The ADS1113 and VL53L4CD are powered by the external regulated 3.3 V
+ *    sensor supply shown in the system diagram, not by an ESP32 GPIO or its
+ *    3V3 pin.  The external supply ground and ESP32 ground must be common.
+ *
  *  WIRING
- *    ADS1113:  VDD -> 3V3, GND -> GND, SDA -> GPIO 21, SCL -> GPIO 22
+ *    ADS1113:  VDD -> external 3.3 V, GND -> common GND, SDA -> GPIO 21, SCL -> GPIO 22
  *              ADDR -> GND (address 0x48)
  *              AIN1 -> GND (the ADS1113 measures AIN0 - AIN1)
  *              AIN0 -> divider output
  *
- *    VL53L4CD: SDA -> GPIO 21, SCL -> GPIO 22, address 0x29
+ *    VL53L4CD: VDD -> external 3.3 V, GND -> common GND,
+ *              SDA -> GPIO 21, SCL -> GPIO 22, address 0x29
  *              shared with the ADS1113 on I2C controller 0
  *
  *    Input divider:

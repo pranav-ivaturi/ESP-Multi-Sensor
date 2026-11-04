@@ -47,7 +47,9 @@
  *  Pressure  : GPIO34 (ADC1_CH6, input only)
  *  CAN       : GPIO5 = TX, GPIO4 = RX      -> CAN transceiver
  *
- *  Power for all three I2C modules: ESP32 3V3 and GND.
+ *  Power for all sensors: external regulated sensor supply and common GND.
+ *  Do not power sensor VCC/VIN from the ESP32 3V3 pin or a GPIO; this
+ *  firmware only reads sensor signals and never controls sensor power.
  *
  *  Pressure sensor:
  *    VCC -> external 5 V supply

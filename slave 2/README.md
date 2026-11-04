@@ -41,12 +41,18 @@ Slave 2 is part of the **ESP Multi Sensor** distributed Master–Slave CAN archi
 
 ## Wiring
 
+### Sensor power
+
+The ADS1113 and VL53L4CD must be powered from the external regulated 3.3 V sensor supply in the system architecture, not from the ESP32 `3V3` pin or a GPIO. Tie the external-supply ground to ESP32 GND. The firmware does not control sensor power.
+
+If the external sensor rail can remain on while the ESP32 is off, isolate or sequence the I²C lines to prevent them from back-powering the ESP32 through its input pins.
+
 ### ADS1113 → ESP32
 
 | ADS1113 | ESP32 |
 |---|---|
-| VDD | 3.3 V |
-| GND | GND |
+| VDD | External regulated 3.3 V sensor supply |
+| GND | Common ground |
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
 | ADDR | GND |
@@ -59,8 +65,8 @@ The current firmware uses I²C at **400 kHz**.
 
 | VL53L4CD | ESP32 |
 |---|---|
-| VCC | 3.3 V |
-| GND | GND |
+| VCC | External regulated 3.3 V sensor supply |
+| GND | Common ground |
 | SDA | GPIO 21 |
 | SCL | GPIO 22 |
 

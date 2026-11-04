@@ -39,22 +39,25 @@
  *
  *  MAX31865 board       RTD #1       RTD #2
  *  ------------------------------------------
- *  VIN                   3V3          3V3
- *  GND                   GND          GND
+ *  VIN                   external 3.3 V sensor supply (both boards)
+ *  GND                   common GND    common GND
  *  CLK (SCK)             GPIO18       GPIO14
  *  SDI (MOSI)            GPIO23       GPIO13
  *  SDO (MISO)            GPIO19       GPIO27
  *  CS                    GPIO25       GPIO26
  *
  *  Hall sensor:
- *    VCC -> supply required by your sensor
- *    GND -> ESP32 GND
+ *    VCC -> external supply required by your sensor
+ *    GND -> common GND (joined to ESP32 GND)
  *    OUT -> GPIO34
  *
  *  CAN:
  *    ESP32 GPIO5 -> CAN transceiver TXD
  *    ESP32 GPIO4 -> CAN transceiver RXD
  *    CANH / CANL -> CAN bus
+ *
+ *  Sensor power is supplied externally as shown in the system diagram. This
+ *  firmware never drives a GPIO or the ESP32 3V3 rail to power a sensor.
  *
  *  IMPORTANT:
  *    GPIO4/5 are used ONLY for CAN.
