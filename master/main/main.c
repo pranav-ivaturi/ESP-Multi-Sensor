@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -137,6 +138,9 @@ static volatile uint32_t slave2_last_rx = 0;
 static volatile uint32_t slave3_last_rx = 0;
 static volatile uint32_t slave4_last_rx = 0;
 
+static uint32_t master_tlm_tx_ok = 0;
+static uint32_t master_tlm_tx_fail = 0;
+
 
 /* ============================================================
  * BIG-ENDIAN HELPERS
@@ -171,6 +175,73 @@ static uint32_t read_be32(
         ((uint32_t)data[3]);
 }
 
+
+
+/* ============================================================
+ * MASTER TELEMETRY PUBLISHER
+ *
+ * Original Slave frames are decoded by the functions above.
+ * After decoding, the same 8 data bytes are republished using
+ * Master-owned IDs 0x500..0x509. Telemetry ESP forwards these
+ * frames unchanged; Pilot decodes them using this mapping.
+ * ============================================================ */
+static uint32_t master_telemetry_id(uint32_t slave_id)
+{
+    switch (slave_id)
+    {
+        case S1_ID_IMU:               return 0x500;
+        case S1_ID_GYRO_HALL:         return 0x501;
+        case S1_ID_TEMP_STATUS:       return 0x502;
+        case S2_ID_ADC:               return 0x503;
+        case S3_ID_TEMPERATURE:       return 0x504;
+        case S3_ID_DISTANCE_PRESSURE: return 0x505;
+        case S3_ID_STATUS:            return 0x506;
+        case S4_ID_RTDS:              return 0x507;
+        case S4_ID_HALL:              return 0x508;
+        case S4_ID_LIDAR:             return 0x509;
+        default:                      return 0;
+    }
+}
+
+static void publish_master_telemetry(const can_rx_message_t *message)
+{
+    uint32_t out_id = master_telemetry_id(message->id);
+    if (out_id == 0 || message->length != CAN_FRAME_LENGTH)
+        return;
+
+    /*
+     * TWAI transmit is asynchronous. We wait for completion before
+     * returning so the stack-backed frame/data remain valid.
+     */
+    twai_frame_t tx_frame = {
+        .header.id = out_id,
+        .header.ide = false,  /* Standard 11-bit CAN identifier */
+        .buffer = (uint8_t *)message->data,
+        .buffer_len = CAN_FRAME_LENGTH,
+    };
+
+    esp_err_t err = twai_node_transmit(can_node, &tx_frame, 20);
+    if (err != ESP_OK)
+    {
+        master_tlm_tx_fail++;
+        ESP_LOGE(TAG, "Telemetry CAN enqueue failed ID=0x%03" PRIX32 ": %s",
+                 out_id, esp_err_to_name(err));
+        return;
+    }
+
+    err = twai_node_transmit_wait_all_done(can_node, 100);
+    if (err != ESP_OK)
+    {
+        master_tlm_tx_fail++;
+        ESP_LOGE(TAG, "Telemetry CAN TX not confirmed ID=0x%03" PRIX32 ": %s",
+                 out_id, esp_err_to_name(err));
+        return;
+    }
+
+    master_tlm_tx_ok++;
+    ESP_LOGD(TAG, "Published Slave ID 0x%03" PRIX32 " as Master ID 0x%03" PRIX32,
+             message->id, out_id);
+}
 
 /* ============================================================
  * CAN RECEIVE CALLBACK
@@ -988,6 +1059,10 @@ static void process_can_message(
 
             break;
     }
+
+    /* Decode first, then publish the matching Master telemetry frame. */
+    if (master_telemetry_id(message->id) != 0)
+        publish_master_telemetry(message);
 }
 
 
@@ -1080,6 +1155,8 @@ static void master_status_task(
             slave4_online ? "ONLINE" : "OFFLINE"
         );
 
+        ESP_LOGI(TAG, "MASTER TELEMETRY TX | OK=%" PRIu32 " FAIL=%" PRIu32,
+                 master_tlm_tx_ok, master_tlm_tx_fail);
 
         vTaskDelay(
             pdMS_TO_TICKS(1000)
