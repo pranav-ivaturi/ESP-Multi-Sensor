@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  ESP32 "SLAVE 4" - DUAL PT100 RTD + HALL SENSOR (+ LIDAR LATER)
+ *  ESP32 "SLAVE 4" - DUAL PT100 RTD + HALL SENSOR
  * ============================================================
  *
  *  Board : ESP32-WROOM-32 DevKit
@@ -10,7 +10,6 @@
  *    1. PT100 RTD #1 via MAX31865 board  - SPI2 (own bus)
  *    2. PT100 RTD #2 via MAX31865 board  - SPI3 (own bus)
  *    3. Analog Hall-effect sensor        - ADC1_CH6 (GPIO34)
- *    4. VL53L4CD LiDAR                   - NOT IMPLEMENTED YET (placeholder)
  *
  * ------------------------------------------------------------
  *  FIRST-TIME PROJECT SETUP
@@ -71,7 +70,6 @@
  *
  *    0x400 -> PT100 temperatures + status
  *    0x401 -> Hall sensor data
- *    0x402 -> LiDAR data + status
  *
  *  All values below use BIG-ENDIAN encoding, matching
  *  Slave 1 and Slave 3.
@@ -92,14 +90,6 @@
  *               bit 0 = Hall valid
  *    Byte 5-6 : packet counter
  *    Byte 7   : reserved
- *
- *  0x402:
- *    Byte 0-1 : LiDAR distance in mm, signed
- *               -1 = not available
- *    Byte 2-3 : packet counter
- *    Byte 4   : status
- *               bit 0 = LiDAR valid
- *    Byte 5-7 : reserved
  *
  * ============================================================
  */
@@ -184,7 +174,6 @@
 
 #define CAN_ID_RTDS         0x400
 #define CAN_ID_HALL         0x401
-#define CAN_ID_LIDAR        0x402
 
 #define CAN_TX_QUEUE_DEPTH  6
 
@@ -442,34 +431,6 @@ static bool hall_read(int *raw_avg, float *volts)
 
 
 /* ============================================================
- * LIDAR VL53L4CD (PLACEHOLDER)
- *
- * The LiDAR remains exactly as before.
- *
- * Until a driver is added:
- *     lidar_read_distance() returns -1
- *
- * Planned:
- *     SDA -> GPIO21
- *     SCL -> GPIO22
- *     Address -> 0x29
- * ============================================================ */
-
-static void lidar_init(void)
-{
-    /* TODO: initialise VL53L4CD and start ranging */
-}
-
-
-static int lidar_read_distance(void)
-{
-    /* TODO: return distance in mm, or -1 on error */
-
-    return -1;
-}
-
-
-/* ============================================================
  * CAN / TWAI
  * ============================================================ */
 
@@ -521,10 +482,9 @@ static bool init_can(void)
              CAN_RX_GPIO);
 
     ESP_LOGI(TAG,
-             "Slave 4 CAN IDs: 0x%03X / 0x%03X / 0x%03X",
+             "Slave 4 CAN IDs: 0x%03X / 0x%03X",
              CAN_ID_RTDS,
-             CAN_ID_HALL,
-             CAN_ID_LIDAR);
+              CAN_ID_HALL);
 
     return true;
 }
@@ -704,61 +664,6 @@ static esp_err_t can_send_hall(int hall_raw,
 
 
 /* ============================================================
- * SEND LIDAR CAN FRAME
- *
- * ID: 0x402
- *
- * Byte 0-1 : distance in mm, signed
- *            -1 = unavailable
- * Byte 2-3 : packet counter
- * Byte 4   : status
- * Byte 5-7 : reserved
- * ============================================================ */
-
-static esp_err_t can_send_lidar(int distance_mm,
-                                uint16_t sequence)
-{
-    static uint8_t data[8];
-
-
-    put_be_signed16(
-        &data[0],
-        (int16_t)distance_mm);
-
-
-    put_be16(
-        &data[2],
-        sequence);
-
-
-    data[4] =
-        (distance_mm >= 0)
-        ? 0x01
-        : 0x00;
-
-
-    data[5] = 0;
-    data[6] = 0;
-    data[7] = 0;
-
-
-    twai_frame_t frame = {
-        .header.id = CAN_ID_LIDAR,
-        .header.ide = false,
-
-        .buffer = data,
-        .buffer_len = sizeof(data),
-    };
-
-
-    return twai_node_transmit(
-        can_node,
-        &frame,
-        0);
-}
-
-
-/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -811,11 +716,6 @@ void app_main(void)
                  "Hall setup failed: %s",
                  esp_err_to_name(hall_err));
     }
-
-
-    /* Existing LiDAR placeholder */
-
-    lidar_init();
 
 
     /* New CAN initialization */
@@ -884,14 +784,6 @@ void app_main(void)
 
 
         /* ----------------------------------------------------
-         * Existing LiDAR placeholder
-         * ---------------------------------------------------- */
-
-        int distance_mm =
-            lidar_read_distance();
-
-
-        /* ----------------------------------------------------
          * Existing Serial output
          * ---------------------------------------------------- */
 
@@ -899,8 +791,7 @@ void app_main(void)
                "RTD1=%.2f C | "
                "RTD2=%.2f C | "
                "HALL_RAW=%d | "
-               "HALL_V=%.3f V | "
-               "LIDAR=%d mm\n",
+               "HALL_V=%.3f V\n",
 
                t1_valid ? temp1 : -999.0f,
 
@@ -908,9 +799,7 @@ void app_main(void)
 
                h_valid ? hall_raw : -1,
 
-               h_valid ? hall_volts : -1.0f,
-
-               distance_mm);
+                h_valid ? hall_volts : -1.0f);
 
 
         /* ----------------------------------------------------
@@ -954,19 +843,6 @@ void app_main(void)
                          esp_err_to_name(can_err));
             }
 
-
-            can_err =
-                can_send_lidar(
-                    distance_mm,
-                    sequence);
-
-
-            if (can_err != ESP_OK) {
-
-                ESP_LOGE(TAG,
-                         "CAN LiDAR transmit failed: %s",
-                         esp_err_to_name(can_err));
-            }
         }
 
 

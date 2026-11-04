@@ -95,12 +95,12 @@ The Telemetry ESP32 accepts only the following Master-generated telemetry frames
 | `0x501` | Slave 1 — Gyroscope / Hall |
 | `0x502` | Slave 1 — Temperature / Status |
 | `0x503` | Slave 2 — ADC |
+| `0x509` | Slave 2 — LiDAR |
 | `0x504` | Slave 3 — Temperature |
 | `0x505` | Slave 3 — Distance / Pressure |
 | `0x506` | Slave 3 — Status |
 | `0x507` | Slave 4 — RTD |
 | `0x508` | Slave 4 — Hall |
-| `0x509` | Slave 4 — LiDAR |
 
 All accepted frames use standard 11-bit Classical CAN format with an 8-byte payload.
 

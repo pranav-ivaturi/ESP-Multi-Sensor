@@ -71,8 +71,8 @@ The ESP32 contains an integrated TWAI controller but requires an external physic
    |Slave 1 | |Slave 2 | |Slave 3 | |Slave 4 |
    |        | |        | |        | |        |
    |IMU     | |ADC     | |IR Temp | |PT100   |
-   |Gyro    | |ADS1115 | |LiDAR   | |Hall    |
-   |Hall    | |        | |Pressure| |LiDAR   |
+   |Gyro    | |ADS1113 | |LiDAR   | |Hall    |
+   |Hall    | |LiDAR   | |Pressure| |        |
    |PT100x2 | |        | |        | |        |
    +--------+ +--------+ +--------+ +--------+
        |          |         |         |
@@ -134,12 +134,12 @@ All currently supported slave frames use:
 | Slave 1 | `0x101` | Gyroscope X, Y, Z and Hall ADC |
 | Slave 1 | `0x102` | Temperatures, Hall digital output, RTD faults, status |
 | Slave 2 | `0x200` | ADC raw value, voltages, packet counter |
+| Slave 2 | `0x201` | LiDAR distance, status, packet counter |
 | Slave 3 | `0x300` | Two IR sensors' ambient and object temperatures |
 | Slave 3 | `0x301` | LiDAR distance, pressure, sequence |
 | Slave 3 | `0x302` | Sensor status flags |
 | Slave 4 | `0x400` | PT100 temperatures, status, sequence |
 | Slave 4 | `0x401` | Hall raw value, voltage, status, sequence |
-| Slave 4 | `0x402` | LiDAR distance, sequence, status |
 
 ### 4.2 Master Telemetry CAN ID Mapping
 
@@ -151,12 +151,12 @@ The Master maps the original slave CAN identifiers to its own telemetry identifi
 | `0x101` | `0x501` |
 | `0x102` | `0x502` |
 | `0x200` | `0x503` |
+| `0x201` | `0x509` |
 | `0x300` | `0x504` |
 | `0x301` | `0x505` |
 | `0x302` | `0x506` |
 | `0x400` | `0x507` |
 | `0x401` | `0x508` |
-| `0x402` | `0x509` |
 
 The Master republishes the original eight-byte data payload without modifying its contents.
 
@@ -216,6 +216,15 @@ Status byte:
 
 The Master currently interprets these fields as big-endian.
 
+**ID `0x201` — LiDAR**
+
+| Bytes | Field | Type |
+|---|---|---|
+| 0–1 | LiDAR distance (mm); `-1` when unavailable | `int16_t` |
+| 2–3 | Sequence number | `uint16_t` |
+| 4 | Status (bit 0: valid measurement) | `uint8_t` |
+| 5–7 | Reserved | — |
+
 ### 5.3 Slave 3
 
 **ID `0x300` — IR Temperature Sensors**
@@ -274,19 +283,6 @@ Invalid-value markers defined by the Slave 3 protocol:
 | 4 | Status | `uint8_t` |
 | 5–6 | Sequence number | `uint16_t` |
 | 7 | Reserved | — |
-
-**ID `0x402` — LiDAR**
-
-| Bytes | Field | Type |
-|---|---|---|
-| 0–1 | LiDAR distance (mm) | `int16_t` |
-| 2–3 | Sequence number | `uint16_t` |
-| 4 | Status | `uint8_t` |
-| 5–7 | Reserved | — |
-
-Negative LiDAR values are displayed as unavailable.
-
----
 
 ## 6. Software Implementation
 
@@ -424,6 +420,7 @@ I (xxx) MASTER: S1 | GYRO/HALL | GX=1 GY=2 GZ=3 HALL=1240
 I (xxx) MASTER: S1 | TEMP | T1=24.51 C T2=24.60 C HALL_D0=1 RTD1F=0 RTD2F=0 STATUS=0x03
 
 I (xxx) MASTER: S2 | ADC | RAW=16384 ADC=1.024 V INPUT=1.536 V SEQ=42
+I (xxx) MASTER: S2 | LIDAR | DIST=-1 mm STATUS=0x00 SEQ=42
 
 I (xxx) MASTER: S3 | TEMP | T1A=25.00 C T1O=26.50 C T2A=24.80 C T2O=27.10 C
 I (xxx) MASTER: S3 | DIST/PRESS | LIDAR=450 mm PRESSURE=12000 Pa SEQ=20
@@ -451,8 +448,8 @@ I (xxx) MASTER: MASTER TELEMETRY TX | OK=100 FAIL=0
 
 ## 11. Known Limitations
 
-1. **Slave 2 byte order:** The Master decodes CAN ID `0x200` as big-endian. Slave 2 must use the same encoding.
-2. **Slave 4 communication:** The Master supports IDs `0x400–0x402`, but the Slave 4 firmware must transmit those frames for it to appear ONLINE.
+1. **Slave 2 byte order:** The Master decodes CAN IDs `0x200` and `0x201` as big-endian. Slave 2 must use the same encoding.
+2. **Slave 4 communication:** The Master supports IDs `0x400–0x401`; Slave 4 transmits RTD and Hall frames only.
 3. **Startup status:** Last-received timestamps start at zero. The status task may briefly report ONLINE before any frame is received.
 4. **Invalid sensor values:** Some invalid-value markers are currently displayed numerically rather than as `N/A`.
 5. **Sequence numbers:** Sequence fields are decoded but are not used for packet-loss detection.

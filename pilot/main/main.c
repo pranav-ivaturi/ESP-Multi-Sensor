@@ -143,13 +143,13 @@ static void emit_sensor_json(uint32_t id, const uint8_t d[8])
         printf("{\"type\":\"sensor\",\"can_id\":\"0x508\",\"sensor\":\"slave4_hall\",\"hall_raw\":%u,\"hall_voltage_v\":%.3f,\"status\":%u,\"sequence\":%u}\n",
                be16u(&d[0]), be16u(&d[2]) / 1000.0, d[4], be16u(&d[5]));
         break;
-    case 0x509: { /* Original 0x402: signed LiDAR distance mm, sequence, status. */
+    case 0x509: { /* Original 0x201: Slave 2 signed LiDAR distance, sequence, status. */
         int16_t distance_mm = be16s(&d[0]);
         if (distance_mm < 0)
-            printf("{\"type\":\"sensor\",\"can_id\":\"0x509\",\"sensor\":\"slave4_lidar\",\"available\":false,\"status\":%u,\"sequence\":%u}\n",
+            printf("{\"type\":\"sensor\",\"can_id\":\"0x509\",\"sensor\":\"slave2_lidar\",\"available\":false,\"status\":%u,\"sequence\":%u}\n",
                    d[4], be16u(&d[2]));
         else
-            printf("{\"type\":\"sensor\",\"can_id\":\"0x509\",\"sensor\":\"slave4_lidar\",\"available\":true,\"distance_mm\":%d,\"status\":%u,\"sequence\":%u}\n",
+            printf("{\"type\":\"sensor\",\"can_id\":\"0x509\",\"sensor\":\"slave2_lidar\",\"available\":true,\"distance_mm\":%d,\"status\":%u,\"sequence\":%u}\n",
                    distance_mm, d[4], be16u(&d[2]));
         break;
     }

@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  ESP32 "SLAVE 2" - ADS1113 16-BIT ADC, SENT OVER CAN
+ *  ESP32 "SLAVE 2" - ADS1113 16-BIT ADC + VL53L4CD LIDAR, SENT OVER CAN
  * ============================================================
  *
  *  Board : ESP32-WROOM-32 DevKit
@@ -20,6 +20,9 @@
  *              AIN1 -> GND (the ADS1113 measures AIN0 - AIN1)
  *              AIN0 -> divider output
  *
+ *    VL53L4CD: SDA -> GPIO 21, SCL -> GPIO 22, address 0x29
+ *              shared with the ADS1113 on I2C controller 0
+ *
  *    Input divider:
  *      INPUT ---- 10k ----+---- ADS1113 AIN0
  *                         |
@@ -34,7 +37,7 @@
  *      120 ohm termination at each END of the bus
  *
  * ------------------------------------------------------------
- *  CAN FRAME 0x200
+ *  CAN FRAMES 0x200 / 0x201
  * ------------------------------------------------------------
  *
  *  Standard 11-bit CAN ID
@@ -45,6 +48,12 @@
  *      bytes 2-3  ADC pin voltage in mV (uint16)
  *      bytes 4-5  original input voltage in mV (uint16)
  *      bytes 6-7  packet counter (uint16)
+ *
+ *  0x201 (LiDAR):
+ *      bytes 0-1  signed distance in mm; -1 when unavailable
+ *      bytes 2-3  packet counter (uint16)
+ *      byte 4     status; bit 0 = valid distance
+ *      bytes 5-7  reserved
  *
  *  IMPORTANT:
  *    All ESP Multi Sensor slaves now use BIG-ENDIAN encoding.
@@ -68,6 +77,8 @@
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 
+#include "vl53l4cd.h"
+
 
 /* ============================================================
  * TAG
@@ -89,6 +100,10 @@ static const char *TAG = "SLAVE_2";
 #define I2C_TIMEOUT_MS          100
 
 #define ADS1113_ADDRESS         0x48
+
+/* The ADS1113 and VL53L4CD have different I2C addresses and can share the
+ * existing 400 kHz bus without changing Slave 2's physical I2C wiring. */
+#define VL53L4CD_ADDRESS        0x29
 
 
 /* ============================================================
@@ -147,6 +162,7 @@ static const char *TAG = "SLAVE_2";
 #define CAN_BITRATE             500000
 
 #define CAN_ID_ADS1113          0x200
+#define CAN_ID_LIDAR            0x201
 
 #define CAN_TX_QUEUE_DEPTH      5
 
@@ -159,8 +175,12 @@ static const char *TAG = "SLAVE_2";
 
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static i2c_master_dev_handle_t ads_dev = NULL;
+static i2c_master_dev_handle_t lidar_dev = NULL;
 
 static twai_node_handle_t can_node = NULL;
+
+static vl53l4cd_t lidar;
+static bool lidar_ready = false;
 
 
 /* ============================================================
@@ -235,6 +255,52 @@ static void i2c_init(void)
             ADS1113_ADDRESS
         );
     }
+}
+
+
+/* ============================================================
+ * VL53L4CD I2C INTERFACE
+ *
+ * The LiDAR shares the existing ADS1113 bus (GPIO21/GPIO22).  The distinct
+ * addresses, 0x48 and 0x29, make both devices independently addressable.
+ * ============================================================ */
+
+static void lidar_i2c_init(void)
+{
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = VL53L4CD_ADDRESS,
+        .scl_speed_hz = I2C_FREQUENCY,
+    };
+
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &device_config,
+                                               &lidar_dev));
+
+    esp_err_t err = vl53l4cd_init(&lidar, lidar_dev);
+    if (err == ESP_OK) {
+        lidar_ready = true;
+        ESP_LOGI(TAG, "VL53L4CD ranging at 0x%02X on the ADS1113 I2C bus",
+                 VL53L4CD_ADDRESS);
+    } else {
+        ESP_LOGE(TAG, "VL53L4CD setup failed: %s", esp_err_to_name(err));
+    }
+}
+
+
+/* Returns a new millimetre measurement, or -1 if ranging is unavailable. */
+static int lidar_read_distance(void)
+{
+    int distance_mm = -1;
+    if (!lidar_ready)
+        return -1;
+
+    esp_err_t err = vl53l4cd_read_distance_mm(&lidar, &distance_mm, 60);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "VL53L4CD ranging failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    return distance_mm;
 }
 
 
@@ -676,6 +742,37 @@ static esp_err_t can_send_ads1113(
 
 
 /* ============================================================
+ * SEND VL53L4CD CAN FRAME (ID 0x201)
+ *
+ * Byte 0-1: signed distance in mm; -1 means unavailable
+ * Byte 2-3: packet counter
+ * Byte 4:   status bit 0 = valid measurement
+ * Byte 5-7: reserved
+ * ============================================================ */
+
+static esp_err_t can_send_lidar(int distance_mm, uint16_t packet_counter)
+{
+    static uint8_t data[8];
+
+    write_be16(&data[0], (uint16_t)(int16_t)distance_mm);
+    write_be16(&data[2], packet_counter);
+    data[4] = distance_mm >= 0 ? 0x01 : 0x00;
+    data[5] = 0;
+    data[6] = 0;
+    data[7] = 0;
+
+    twai_frame_t frame = {
+        .header.id = CAN_ID_LIDAR,
+        .header.ide = false,
+        .buffer = data,
+        .buffer_len = sizeof(data),
+    };
+
+    return twai_node_transmit(can_node, &frame, CAN_TX_TIMEOUT_MS);
+}
+
+
+/* ============================================================
  * MAIN
  * ============================================================ */
 
@@ -707,6 +804,7 @@ void app_main(void)
      * -------------------------------------------------------- */
 
     i2c_init();
+    lidar_i2c_init();
 
 
     /* --------------------------------------------------------
@@ -754,11 +852,9 @@ void app_main(void)
             );
 
 
-            vTaskDelay(
-                pdMS_TO_TICKS(500)
-            );
-
-            continue;
+            raw = 0;
+            adc_voltage = 0.0f;
+            input_voltage = 0.0f;
         }
 
 
@@ -767,12 +863,13 @@ void app_main(void)
          * ---------------------------------------------------- */
 
         esp_err_t can_result =
-            can_send_ads1113(
-                raw,
-                adc_voltage,
-                input_voltage,
-                packet_counter
-            );
+            adc_result == ESP_OK
+            ? can_send_ads1113(raw, adc_voltage, input_voltage, packet_counter)
+            : ESP_ERR_INVALID_STATE;
+
+        int distance_mm = lidar_read_distance();
+        esp_err_t lidar_can_result =
+            can_send_lidar(distance_mm, packet_counter);
 
 
         /* ----------------------------------------------------
@@ -781,11 +878,12 @@ void app_main(void)
 
         ESP_LOGI(
             TAG,
-            "RAW=%d | ADC=%.6f V | INPUT=%.6f V | CAN=%s | CNT=%u",
+            "RAW=%d | ADC=%.6f V | INPUT=%.6f V | LIDAR=%d mm | CAN=%s | CNT=%u",
             raw,
             adc_voltage,
             input_voltage,
-            can_result == ESP_OK
+            distance_mm,
+            (can_result == ESP_OK && lidar_can_result == ESP_OK)
                 ? "OK"
                 : "ERROR",
             packet_counter

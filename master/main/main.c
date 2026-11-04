@@ -81,6 +81,7 @@ static const char *TAG = "MASTER";
  * ============================================================ */
 
 #define S2_ID_ADC               0x200
+#define S2_ID_LIDAR             0x201
 
 
 /* ============================================================
@@ -98,7 +99,6 @@ static const char *TAG = "MASTER";
 
 #define S4_ID_RTDS              0x400
 #define S4_ID_HALL              0x401
-#define S4_ID_LIDAR             0x402
 
 
 /* ============================================================
@@ -193,12 +193,12 @@ static uint32_t master_telemetry_id(uint32_t slave_id)
         case S1_ID_GYRO_HALL:         return 0x501;
         case S1_ID_TEMP_STATUS:       return 0x502;
         case S2_ID_ADC:               return 0x503;
+        case S2_ID_LIDAR:             return 0x509;
         case S3_ID_TEMPERATURE:       return 0x504;
         case S3_ID_DISTANCE_PRESSURE: return 0x505;
         case S3_ID_STATUS:            return 0x506;
         case S4_ID_RTDS:              return 0x507;
         case S4_ID_HALL:              return 0x508;
-        case S4_ID_LIDAR:             return 0x509;
         default:                      return 0;
     }
 }
@@ -621,13 +621,19 @@ static void decode_slave2(
     const can_rx_message_t *message
 )
 {
-    if (
-        message->id !=
-        S2_ID_ADC
-    )
+    if (message->id == S2_ID_LIDAR)
     {
+        int16_t distance_mm = read_be_signed16(&message->data[0]);
+        uint16_t sequence = read_be16(&message->data[2]);
+        uint8_t status = message->data[4];
+
+        ESP_LOGI(TAG, "S2 | LIDAR | DIST=%d mm STATUS=0x%02X SEQ=%u",
+                 distance_mm, status, sequence);
         return;
     }
+
+    if (message->id != S2_ID_ADC)
+        return;
 
 
     /*
@@ -917,56 +923,6 @@ static void decode_slave4(
         }
 
 
-        /*
-         * ----------------------------------------------------
-         * 0x402
-         *
-         * LiDAR distance
-         * packet counter
-         * status
-         * ----------------------------------------------------
-         */
-
-        case S4_ID_LIDAR:
-        {
-            int16_t distance_mm =
-                read_be_signed16(
-                    &message->data[0]
-                );
-
-            uint16_t sequence =
-                read_be16(
-                    &message->data[2]
-                );
-
-            uint8_t status =
-                message->data[4];
-
-
-            if (distance_mm < 0)
-            {
-                ESP_LOGI(
-                    TAG,
-                    "S4 | LIDAR | unavailable STATUS=0x%02X SEQ=%u",
-                    status,
-                    sequence
-                );
-            }
-            else
-            {
-                ESP_LOGI(
-                    TAG,
-                    "S4 | LIDAR | DIST=%d mm STATUS=0x%02X SEQ=%u",
-                    distance_mm,
-                    status,
-                    sequence
-                );
-            }
-
-            break;
-        }
-
-
         default:
             break;
     }
@@ -1004,6 +960,7 @@ static void process_can_message(
          */
 
         case S2_ID_ADC:
+        case S2_ID_LIDAR:
 
             slave2_last_rx =
                 xTaskGetTickCount();
@@ -1035,7 +992,6 @@ static void process_can_message(
 
         case S4_ID_RTDS:
         case S4_ID_HALL:
-        case S4_ID_LIDAR:
 
             slave4_last_rx =
                 xTaskGetTickCount();

@@ -1,14 +1,14 @@
-# ESP32 Slave 2 — ADS1113 CAN Telemetry
+# ESP32 Slave 2 — ADS1113 + VL53L4CD CAN Telemetry
 
 ## Overview
 
-Slave 2 is an ESP32-WROOM-32 based sensor node for measuring an analog input through an ADS1113 16-bit ADC and transmitting the measured data to the Master through the CAN bus.
+Slave 2 is an ESP32-WROOM-32 based sensor node for measuring an analog input through an ADS1113 16-bit ADC and hosting the VL53L4CD LiDAR interface relocated from Slave 4. It transmits both data sets to the Master through CAN.
 
 The node performs:
 
 1. ADS1113 ADC acquisition
-2. Voltage conversion
-3. External voltage-divider compensation
+2. Voltage conversion and external voltage-divider compensation
+3. VL53L4CD LiDAR I²C interface
 4. CAN/TWAI initialization
 5. Periodic CAN transmission
 
@@ -31,6 +31,12 @@ Slave 2 is part of the **ESP Multi Sensor** distributed Master–Slave CAN archi
 - I²C address: `0x48`
 - Differential measurement: `AIN0 - AIN1`
 
+### VL53L4CD LiDAR
+
+- I²C address: `0x29`
+- Shares the ADS1113 I²C bus; the devices use distinct addresses (`0x29` and `0x48`)
+- Initialised with the VL53L4CD Ultra Lite Driver register sequence and ranged continuously with a 50 ms timing budget
+
 ---
 
 ## Wiring
@@ -48,6 +54,17 @@ Slave 2 is part of the **ESP Multi Sensor** distributed Master–Slave CAN archi
 | AIN0 | Voltage-divider output |
 
 The current firmware uses I²C at **400 kHz**.
+
+### VL53L4CD → ESP32
+
+| VL53L4CD | ESP32 |
+|---|---|
+| VCC | 3.3 V |
+| GND | GND |
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
+
+The relocated LiDAR shares I²C controller 0 with the ADS1113 at 400 kHz. Their distinct addresses allow both sensors to operate on the existing GPIO 21/22 bus.
 
 ### Input Voltage Divider
 
@@ -103,7 +120,7 @@ Use **120 Ω termination at both physical ends of the CAN bus**.
 | Parameter | Value |
 |---|---|
 | CAN bitrate | **500 kbit/s** |
-| CAN ID | **0x200** |
+| CAN IDs | **0x200** (ADS1113), **0x201** (LiDAR) |
 | Frame type | Standard 11-bit |
 | Data length | 8 bytes |
 | Encoding | **Big-endian** |
@@ -115,7 +132,7 @@ The firmware uses GPIO 5 for TX, GPIO 4 for RX and a 500000 bit/s bitrate.
 
 # CAN Frame — ID 0x200
 
-Slave 2 uses one 8-byte CAN frame.
+Slave 2 uses two 8-byte CAN frames.
 
 ### Big-endian payload
 
@@ -138,6 +155,19 @@ Byte 1 = 0x34
 ```
 
 This was changed from the original little-endian implementation so that Slave 2 now uses the same CAN encoding convention as the other slaves.
+
+---
+
+# CAN Frame — ID 0x201
+
+| Bytes | Field | Type |
+|---|---|---|
+| 0–1 | LiDAR distance in mm; `-1` when unavailable | `int16_t` |
+| 2–3 | Packet counter | `uint16_t` |
+| 4 | Status; bit 0 means a valid distance | `uint8_t` |
+| 5–7 | Reserved | — |
+
+The VL53L4CD hardware interface has moved from Slave 4. Slave 2 validates the module identity during startup, runs continuous ranging, and transmits each valid millimetre measurement. It sends `-1` with status `0x00` if the module is absent, a measurement times out, or the sensor reports an invalid range result.
 
 ---
 
@@ -188,8 +218,8 @@ The counter allows the Master to identify missing or repeated packets.
               SLAVE 2
                  │
         ┌────────▼────────┐
-        │     ADS1113     │
-        │   16-bit ADC    │
+        │ ADS1113 + LiDAR │
+        │ Shared I²C0     │
         └────────┬────────┘
                  │
             ESP32-WROOM-32
@@ -237,6 +267,9 @@ Initialize I²C
 Detect ADS1113
   │
   ▼
+Detect VL53L4CD
+  │
+  ▼
 Initialize CAN/TWAI
   │
   ▼
@@ -256,6 +289,9 @@ Pack data in BIG-ENDIAN format
   │
   ▼
 Transmit CAN ID 0x200
+  │
+  ▼
+Transmit CAN ID 0x201
   │
   ▼
 Increment packet counter
@@ -291,14 +327,15 @@ A successful startup should show:
 
 ```text
 ESP32 SLAVE 2
-ADS1113 + CAN
+ADS1113 + VL53L4CD + CAN
 I2C initialized
 ADS1113 detected at 0x48
+VL53L4CD ranging at 0x29 on the ADS1113 I2C bus
 CAN initialized
 CAN TX GPIO : 5
 CAN RX GPIO : 4
 CAN bitrate : 500000 bit/s
-CAN ID      : 0x200
+CAN IDs     : 0x200 / 0x201
 System initialized
 ```
 
@@ -320,6 +357,7 @@ Slave 2:
 
 ```text
 0x200
+0x201
 ```
 
 This common encoding allows the Master to use one decoding method for all sensor nodes.

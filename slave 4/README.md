@@ -1,4 +1,4 @@
-# ESP32 Slave 4 — Dual PT100 + Hall + LiDAR CAN Node
+# ESP32 Slave 4 — Dual PT100 + Hall CAN Node
 
 ## Overview
 
@@ -7,7 +7,6 @@ Slave 4 is an ESP32-WROOM-32 based sensor node containing:
 1. PT100 RTD #1 through MAX31865
 2. PT100 RTD #2 through MAX31865
 3. Analog Hall-effect sensor
-4. VL53L4CD LiDAR interface placeholder
 
 Slave 4 is part of the **ESP Multi Sensor** Master–Slave CAN architecture.
 
@@ -28,9 +27,6 @@ The existing sensor acquisition behavior has been retained. CAN communication wa
 - 2 × PT100 RTD
 - 2 × MAX31865 RTD interface boards
 - Analog Hall-effect sensor
-- VL53L4CD LiDAR
-
-The current LiDAR implementation remains a placeholder and returns `-1` until the VL53L4CD driver is added.
 
 ---
 
@@ -85,33 +81,6 @@ If the Hall sensor is powered from 5 V and its output can exceed the ESP32 ADC l
 
 ---
 
-# LiDAR
-
-The planned VL53L4CD connection is:
-
-| VL53L4CD | ESP32 |
-|---|---|
-| SDA | GPIO 21 |
-| SCL | GPIO 22 |
-| VCC | 3.3 V |
-| GND | GND |
-
-I²C address:
-
-```text
-0x29
-```
-
-The LiDAR driver is **not currently implemented**. Until it is implemented, the firmware reports:
-
-```text
-LIDAR = -1 mm
-```
-
-This preserves the CAN packet structure for later integration. 
-
----
-
 # CAN Communication
 
 Slave 4 uses the ESP32's built-in TWAI controller with an external CAN transceiver.
@@ -151,7 +120,6 @@ Slave 4 uses the following CAN identifiers:
 ```text
 0x400 → PT100 data
 0x401 → Hall sensor data
-0x402 → LiDAR data
 ```
 
 ---
@@ -216,35 +184,6 @@ All multi-byte values use **big-endian encoding**.
 
 ---
 
-# CAN Frame 0x402 — LiDAR
-
-Eight-byte payload:
-
-| Byte | Data |
-|---:|---|
-| 0–1 | LiDAR distance in mm |
-| 2–3 | Packet counter |
-| 4 | Status |
-| 5–7 | Reserved |
-
-The distance is a signed 16-bit value.
-
-```text
-distance >= 0
-    → valid measurement
-
-distance = -1
-    → LiDAR unavailable / not implemented
-```
-
-Status:
-
-```text
-Bit 0 → LiDAR valid
-```
-
----
-
 # Big-Endian Convention
 
 Slave 4 follows the common CAN encoding standard used throughout the ESP Multi Sensor architecture.
@@ -281,9 +220,9 @@ The ESP Multi Sensor network currently uses:
 | Node | CAN IDs |
 |---|---|
 | Slave 1 | `0x100–0x102` |
-| Slave 2 | `0x200` |
+| Slave 2 | `0x200–0x201` |
 | Slave 3 | `0x300–0x302` |
-| Slave 4 | `0x400–0x402` |
+| Slave 4 | `0x400–0x401` |
 | Master | Receives / processes |
 
 This gives each slave its own ID range and makes CAN debugging easier.
@@ -298,7 +237,6 @@ PT100 #2 ──┤
            │
 Hall ──────┼──► Slave 4 ESP32
            │          │
-LiDAR ─────┘          │
                       ▼
                  Local processing
                       │
@@ -332,9 +270,6 @@ Initialize RTD #2
 Initialize Hall ADC
   │
   ▼
-Initialize LiDAR placeholder
-  │
-  ▼
 Initialize CAN
   │
   ▼
@@ -347,13 +282,10 @@ Read RTD #2      │
   ▼              │
 Read Hall        │
   │              │
-  ▼              │
-Read LiDAR       │
-  │              │
   └──────┬───────┘
          ▼
    Transmit CAN
-   0x400 / 0x401 / 0x402
+   0x400 / 0x401
          │
          ▼
     Wait 500 ms
@@ -401,18 +333,4 @@ The purpose of using one encoding convention is to make the Master firmware simp
 
 ---
 
-## Current LiDAR Status
-
-The VL53L4CD hardware interface is defined, but its driver has not yet been integrated into the Slave 4 firmware.
-
-Therefore:
-
-```text
-0x402
-distance = -1
-status bit 0 = 0
-```
-
-until the actual ranging implementation is added.
-
-The PT100 and Hall sensor functionality remains independent of the LiDAR implementation.
+The VL53L4CD interface and CAN frame have moved to Slave 2. Slave 4 now operates independently as the PT100 and Hall node.
