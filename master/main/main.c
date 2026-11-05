@@ -25,7 +25,9 @@
  *    - Prints decoded sensor data
  *    - Tracks slave communication
  *
- *  NO HARDWARE CONTROL IS IMPLEMENTED YET.
+ *  RELAY CONTROL
+ *    Validated GUI keepalives arrive through Telemetry, are forwarded to
+ *    Slave 2, and expire to an OFF command when the control path is stale.
  *
  * ============================================================
  */
@@ -34,6 +36,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -82,6 +85,16 @@ static const char *TAG = "MASTER";
 
 #define S2_ID_ADC               0x200
 #define S2_ID_LIDAR             0x201
+#define S2_ID_RELAY_STATUS      0x202
+
+/* Control frames are intentionally outside the sensor and telemetry ranges. */
+#define TLM_ID_RELAY_STATUS     0x50A
+#define TLM_ID_RELAY_COMMAND    0x600 /* Telemetry -> Master */
+#define S2_ID_RELAY_COMMAND     0x610 /* Master -> Slave 2 */
+#define RELAY_COMMAND_MAGIC     0xA5
+#define RELAY_COMMAND_TRAILER   0x5A
+#define RELAY_HEARTBEAT_MS      250
+#define RELAY_GUI_TIMEOUT_MS    1000
 
 
 /* ============================================================
@@ -141,6 +154,11 @@ static volatile uint32_t slave4_last_rx = 0;
 static uint32_t master_tlm_tx_ok = 0;
 static uint32_t master_tlm_tx_fail = 0;
 
+/* Relay stays OFF until a valid, fresh command is received from Telemetry. */
+static bool relay_requested = false;
+static uint16_t relay_sequence = 0;
+static TickType_t relay_last_gui_command = 0;
+
 
 /* ============================================================
  * BIG-ENDIAN HELPERS
@@ -175,6 +193,20 @@ static uint32_t read_be32(
         ((uint32_t)data[3]);
 }
 
+static void write_be16(uint8_t *data, uint16_t value)
+{
+    data[0] = (uint8_t)(value >> 8);
+    data[1] = (uint8_t)value;
+}
+
+static uint8_t relay_command_checksum(const uint8_t data[8])
+{
+    uint8_t checksum = 0;
+    for (int i = 0; i < 6; ++i)
+        checksum ^= data[i];
+    return checksum;
+}
+
 
 
 /* ============================================================
@@ -194,12 +226,77 @@ static uint32_t master_telemetry_id(uint32_t slave_id)
         case S1_ID_TEMP_STATUS:       return 0x502;
         case S2_ID_ADC:               return 0x503;
         case S2_ID_LIDAR:             return 0x509;
+        case S2_ID_RELAY_STATUS:      return TLM_ID_RELAY_STATUS;
         case S3_ID_TEMPERATURE:       return 0x504;
         case S3_ID_DISTANCE_PRESSURE: return 0x505;
         case S3_ID_STATUS:            return 0x506;
         case S4_ID_RTDS:              return 0x507;
         case S4_ID_HALL:              return 0x508;
         default:                      return 0;
+    }
+}
+
+/* Send one Master-owned relay heartbeat to Slave 2. */
+static void send_relay_command(void)
+{
+    uint8_t data[CAN_FRAME_LENGTH] = {0};
+    data[0] = RELAY_COMMAND_MAGIC;
+    data[1] = relay_requested ? 1 : 0;
+    write_be16(&data[2], relay_sequence);
+    data[4] = 'M';
+    data[5] = '2';
+    data[6] = relay_command_checksum(data);
+    data[7] = RELAY_COMMAND_TRAILER;
+
+    twai_frame_t frame = {
+        .header.id = S2_ID_RELAY_COMMAND,
+        .header.ide = false,
+        .buffer = data,
+        .buffer_len = sizeof(data),
+    };
+
+    esp_err_t err = twai_node_transmit(can_node, &frame, 20);
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "Relay command TX failed: %s", esp_err_to_name(err));
+}
+
+/* Accept only the exact, CRC-checked command format emitted by Telemetry. */
+static void handle_telemetry_relay_command(const can_rx_message_t *message)
+{
+    const uint8_t *data = message->data;
+    uint16_t sequence = read_be16(&data[2]);
+    uint16_t delta = (uint16_t)(sequence - relay_sequence);
+
+    if (message->length != CAN_FRAME_LENGTH ||
+        data[0] != RELAY_COMMAND_MAGIC || data[1] > 1 ||
+        data[4] != 'G' || data[5] != 'U' ||
+        data[6] != relay_command_checksum(data) ||
+        data[7] != RELAY_COMMAND_TRAILER ||
+        (relay_last_gui_command != 0 && (delta == 0 || delta >= 0x8000))) {
+        ESP_LOGW(TAG, "Rejected invalid or stale relay command");
+        return;
+    }
+
+    relay_requested = data[1] == 1;
+    relay_sequence = sequence;
+    relay_last_gui_command = xTaskGetTickCount();
+    ESP_LOGI(TAG, "Validated GUI relay request: %s, sequence=%u",
+             relay_requested ? "ON" : "OFF", relay_sequence);
+}
+
+/* A loss of GUI/Telemetry keepalives is an explicit OFF command. */
+static void relay_command_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+        if (relay_requested &&
+            (now - relay_last_gui_command) > pdMS_TO_TICKS(RELAY_GUI_TIMEOUT_MS)) {
+            relay_requested = false;
+            ESP_LOGW(TAG, "Relay GUI keepalive expired; requesting OFF");
+        }
+        send_relay_command();
+        vTaskDelay(pdMS_TO_TICKS(RELAY_HEARTBEAT_MS));
     }
 }
 
@@ -621,6 +718,20 @@ static void decode_slave2(
     const can_rx_message_t *message
 )
 {
+    if (message->id == S2_ID_RELAY_STATUS)
+    {
+        uint8_t state = message->data[0];
+        uint8_t faults = message->data[1];
+        uint16_t sequence = read_be16(&message->data[2]);
+        uint16_t age_ms = read_be16(&message->data[4]);
+
+        ESP_LOGI(TAG,
+                 "S2 | RELAY | CMD=%u OUT=%u FB=%u FRESH=%u FAULT=0x%02X SEQ=%u AGE=%u ms",
+                 state & 0x01, (state >> 1) & 0x01, (state >> 2) & 0x01,
+                 (state >> 4) & 0x01, faults, sequence, age_ms);
+        return;
+    }
+
     if (message->id == S2_ID_LIDAR)
     {
         int16_t distance_mm = read_be_signed16(&message->data[0]);
@@ -961,12 +1072,17 @@ static void process_can_message(
 
         case S2_ID_ADC:
         case S2_ID_LIDAR:
+        case S2_ID_RELAY_STATUS:
 
             slave2_last_rx =
                 xTaskGetTickCount();
 
             decode_slave2(message);
 
+            break;
+
+        case TLM_ID_RELAY_COMMAND:
+            handle_telemetry_relay_command(message);
             break;
 
 
@@ -1194,6 +1310,15 @@ void app_main(void)
         3072,
         NULL,
         5,
+        NULL
+    );
+
+    xTaskCreate(
+        relay_command_task,
+        "relay_command",
+        3072,
+        NULL,
+        8,
         NULL
     );
 

@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
@@ -19,13 +20,18 @@
 #define MAX_FRAMES 4
 #define POD_ADDRESS 1
 #define TLM_ID_MIN 0x500
-#define TLM_ID_MAX 0x509
+#define TLM_ID_MAX 0x50A
+#define RELAY_HEARTBEAT_MS 250
+#define GUI_COMMAND_TIMEOUT_MS 1000
 
 static uint32_t packets_received, packets_lost, bad_crc, malformed, duplicate_old;
 static uint32_t last_seq;
 static bool have_seq;
 static int64_t rssi_sum, snr_sum;
 static uint32_t radio_samples;
+static volatile bool gui_relay_requested;
+static volatile TickType_t gui_relay_last_command;
+static uint16_t gui_relay_sequence;
 
 static uint16_t crc16_ccitt_false(const uint8_t *p, size_t n)
 {
@@ -72,6 +78,58 @@ static uint32_t be32u(const uint8_t *d)
            ((uint32_t)d[2] << 8) | (uint32_t)d[3];
 }
 
+static void send_relay_keepalive(bool requested, uint16_t sequence)
+{
+    char payload[48];
+    int used = snprintf(payload, sizeof(payload), "LC1,%u,%u", sequence, requested ? 1 : 0);
+    if (used <= 0 || used >= (int)sizeof(payload)) return;
+    uint16_t crc = crc16_ccitt_false((const uint8_t *)payload, (size_t)used);
+    int len = snprintf(payload + used, sizeof(payload) - (size_t)used, "*%04X", crc);
+    if (len <= 0 || len >= (int)(sizeof(payload) - (size_t)used)) return;
+    char command[80];
+    int command_len = snprintf(command, sizeof(command), "AT+SEND=%d,%u,%s\r\n",
+                               POD_ADDRESS, (unsigned)strlen(payload), payload);
+    if (command_len > 0 && command_len < (int)sizeof(command))
+        (void)uart_write_bytes(LORA_UART, command, command_len);
+}
+
+/* GUI input on USB serial: RELAY,1 or RELAY,0. GUI must keep sending at least once/second. */
+static void gui_relay_command_task(void *arg)
+{
+    (void)arg;
+    char line[32];
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        if (strcmp(line, "RELAY,1\n") == 0 || strcmp(line, "RELAY,ON\n") == 0) {
+            gui_relay_requested = true;
+            gui_relay_last_command = xTaskGetTickCount();
+            printf("{\"type\":\"relay_command\",\"accepted\":true,\"requested_on\":true}\n");
+        } else if (strcmp(line, "RELAY,0\n") == 0 || strcmp(line, "RELAY,OFF\n") == 0) {
+            gui_relay_requested = false;
+            gui_relay_last_command = xTaskGetTickCount();
+            printf("{\"type\":\"relay_command\",\"accepted\":true,\"requested_on\":false}\n");
+        } else {
+            printf("{\"type\":\"relay_command\",\"accepted\":false}\n");
+        }
+    }
+}
+
+static void relay_keepalive_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        TickType_t now = xTaskGetTickCount();
+        bool fresh = gui_relay_last_command != 0 &&
+            (now - gui_relay_last_command) <= pdMS_TO_TICKS(GUI_COMMAND_TIMEOUT_MS);
+        bool requested = fresh && gui_relay_requested;
+        if (!fresh && gui_relay_requested) {
+            gui_relay_requested = false;
+            printf("{\"type\":\"relay_command\",\"accepted\":false,\"reason\":\"gui_timeout\"}\n");
+        }
+        send_relay_keepalive(requested, ++gui_relay_sequence);
+        vTaskDelay(pdMS_TO_TICKS(RELAY_HEARTBEAT_MS));
+    }
+}
+
 static void uart_init(void)
 {
     const uart_config_t c = {
@@ -96,7 +154,7 @@ static void emit_raw_can(uint32_t id, uint8_t len, const uint8_t data[8])
     printf("\"}\n");
 }
 
-/* Decode the Master's 0x500-0x509 telemetry map. Multi-byte values are BIG-ENDIAN. */
+/* Decode the Master's 0x500-0x50A telemetry map. Multi-byte values are BIG-ENDIAN. */
 static void emit_sensor_json(uint32_t id, const uint8_t d[8])
 {
     switch (id) {
@@ -153,6 +211,12 @@ static void emit_sensor_json(uint32_t id, const uint8_t d[8])
                    distance_mm, d[4], be16u(&d[2]));
         break;
     }
+    case 0x50A: /* Original 0x202: Slave 2 relay command/output/feedback state. */
+        printf("{\"type\":\"relay_status\",\"can_id\":\"0x50A\",\"requested_on\":%s,\"output_on\":%s,\"feedback_closed\":%s,\"command_fresh\":%s,\"faults\":%u,\"sequence\":%u,\"command_age_ms\":%u}\n",
+               (d[0] & 0x01) ? "true" : "false", (d[0] & 0x02) ? "true" : "false",
+               (d[0] & 0x04) ? "true" : "false", (d[0] & 0x10) ? "true" : "false",
+               d[1], be16u(&d[2]), be16u(&d[4]));
+        break;
     default:
         printf("{\"type\":\"sensor\",\"can_id\":\"0x%03" PRIX32 "\",\"sensor\":\"unknown\"}\n", id);
         break;
@@ -288,5 +352,8 @@ void app_main(void)
     printf("{\"type\":\"boot\",\"device\":\"LoopMIT Pilot telemetry receiver\"}\n");
     printf("{\"type\":\"info\",\"message\":\"JSON on USB serial; Pilot RYLR993 address=2; expected pod source=1\"}\n");
     if (xTaskCreate(receive_task, "lora_rx", 6144, NULL, 8, NULL) != pdPASS)
+        abort();
+    if (xTaskCreate(gui_relay_command_task, "gui_relay", 4096, NULL, 8, NULL) != pdPASS ||
+        xTaskCreate(relay_keepalive_task, "relay_keepalive", 3072, NULL, 9, NULL) != pdPASS)
         abort();
 }

@@ -73,6 +73,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -169,6 +170,22 @@ static const char *TAG = "SLAVE_2";
 
 #define CAN_ID_ADS1113          0x200
 #define CAN_ID_LIDAR            0x201
+#define CAN_ID_RELAY_STATUS     0x202
+#define CAN_ID_RELAY_COMMAND    0x610
+
+/*
+ * GPIO25 drives an external, active-high relay/contactor driver only. It must
+ * never be connected directly to a coil. GPIO26 is an isolated auxiliary
+ * contact feedback input; the relay is fail-safe OFF if it does not confirm.
+ */
+#define RELAY_DRIVER_GPIO        GPIO_NUM_25
+#define RELAY_FEEDBACK_GPIO      GPIO_NUM_26
+#define RELAY_ACTIVE_LEVEL       1
+#define RELAY_COMMAND_TIMEOUT_MS 750
+#define RELAY_FEEDBACK_SETTLE_MS 500
+#define RELAY_STATUS_PERIOD_MS   100
+#define RELAY_COMMAND_MAGIC      0xA5
+#define RELAY_COMMAND_TRAILER    0x5A
 
 #define CAN_TX_QUEUE_DEPTH      5
 
@@ -187,6 +204,22 @@ static twai_node_handle_t can_node = NULL;
 
 static vl53l4cd_t lidar;
 static bool lidar_ready = false;
+
+typedef struct {
+    uint8_t data[8];
+} relay_command_t;
+
+static QueueHandle_t relay_command_queue = NULL;
+static volatile bool relay_requested = false;
+static volatile bool relay_output_on = false;
+static volatile uint8_t relay_faults = 0;
+static volatile uint16_t relay_sequence = 0;
+static volatile TickType_t relay_last_command = 0;
+static TickType_t relay_energized_at = 0;
+
+#define RELAY_FAULT_TIMEOUT  0x01
+#define RELAY_FAULT_FEEDBACK 0x02
+#define RELAY_FAULT_COMMAND  0x04
 
 
 /* ============================================================
@@ -307,6 +340,158 @@ static int lidar_read_distance(void)
     }
 
     return distance_mm;
+}
+
+/* Relay command payload: A5, requested-state, sequence-be16, 'M', '2', XOR, 5A. */
+static uint8_t relay_command_checksum(const uint8_t data[8])
+{
+    uint8_t checksum = 0;
+    for (int i = 0; i < 6; ++i)
+        checksum ^= data[i];
+    return checksum;
+}
+
+static void relay_set_output(bool on)
+{
+    gpio_set_level(RELAY_DRIVER_GPIO,
+                   on ? RELAY_ACTIVE_LEVEL : !RELAY_ACTIVE_LEVEL);
+    relay_output_on = on;
+    if (on)
+        relay_energized_at = xTaskGetTickCount();
+}
+
+static bool relay_feedback_closed(void)
+{
+    return gpio_get_level(RELAY_FEEDBACK_GPIO) == RELAY_ACTIVE_LEVEL;
+}
+
+static void relay_init(void)
+{
+    const gpio_config_t driver_cfg = {
+        .pin_bit_mask = 1ULL << RELAY_DRIVER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    const gpio_config_t feedback_cfg = {
+        .pin_bit_mask = 1ULL << RELAY_FEEDBACK_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&driver_cfg));
+    ESP_ERROR_CHECK(gpio_config(&feedback_cfg));
+    relay_set_output(false); /* Safe state before CAN is initialized. */
+    relay_command_queue = xQueueCreate(8, sizeof(relay_command_t));
+    if (relay_command_queue == NULL)
+        abort();
+}
+
+static bool relay_can_rx_callback(twai_node_handle_t handle,
+                                  const twai_rx_done_event_data_t *edata,
+                                  void *ctx)
+{
+    (void)edata;
+    (void)ctx;
+    relay_command_t command = {0};
+    twai_frame_t frame = {.buffer = command.data, .buffer_len = sizeof(command.data)};
+    if (twai_node_receive_from_isr(handle, &frame) != ESP_OK)
+        return false;
+    if (frame.header.ide || frame.header.id != CAN_ID_RELAY_COMMAND)
+        return false;
+    BaseType_t woken = pdFALSE;
+    (void)xQueueSendFromISR(relay_command_queue, &command, &woken);
+    return woken == pdTRUE;
+}
+
+static void relay_accept_command(const relay_command_t *command)
+{
+    const uint8_t *data = command->data;
+    uint16_t sequence = ((uint16_t)data[2] << 8) | data[3];
+    uint16_t delta = (uint16_t)(sequence - relay_sequence);
+    bool valid = data[0] == RELAY_COMMAND_MAGIC && data[1] <= 1 &&
+                 data[4] == 'M' && data[5] == '2' &&
+                 data[6] == relay_command_checksum(data) &&
+                 data[7] == RELAY_COMMAND_TRAILER &&
+                 (relay_last_command == 0 || delta == 0 || delta < 0x8000);
+    if (!valid) {
+        relay_faults |= RELAY_FAULT_COMMAND;
+        relay_set_output(false);
+        return;
+    }
+
+    relay_requested = data[1] == 1;
+    relay_sequence = sequence;
+    relay_last_command = xTaskGetTickCount();
+    if (!relay_requested) {
+        relay_faults = 0; /* An explicit OFF is the only software fault reset. */
+        relay_set_output(false);
+    } else {
+        relay_faults &= (uint8_t)~RELAY_FAULT_TIMEOUT;
+    }
+}
+
+static esp_err_t can_send_relay_status(void)
+{
+    uint8_t data[8] = {0};
+    bool feedback = relay_feedback_closed();
+    TickType_t now = xTaskGetTickCount();
+    uint32_t age_ms = relay_last_command == 0 ? UINT16_MAX :
+        (uint32_t)pdTICKS_TO_MS(now - relay_last_command);
+    if (age_ms > UINT16_MAX) age_ms = UINT16_MAX;
+
+    data[0] = (relay_requested ? 0x01 : 0) |
+              (relay_output_on ? 0x02 : 0) |
+              (feedback ? 0x04 : 0) |
+              0x08 |
+              ((age_ms <= RELAY_COMMAND_TIMEOUT_MS) ? 0x10 : 0) |
+              (relay_faults ? 0x20 : 0);
+    data[1] = relay_faults;
+    data[2] = (uint8_t)(relay_sequence >> 8);
+    data[3] = (uint8_t)relay_sequence;
+    data[4] = (uint8_t)(age_ms >> 8);
+    data[5] = (uint8_t)age_ms;
+
+    twai_frame_t frame = {.header.id = CAN_ID_RELAY_STATUS, .header.ide = false,
+                          .buffer = data, .buffer_len = sizeof(data)};
+    return twai_node_transmit(can_node, &frame, CAN_TX_TIMEOUT_MS);
+}
+
+static void relay_control_task(void *arg)
+{
+    (void)arg;
+    TickType_t last_status = 0;
+    while (1) {
+        relay_command_t command;
+        while (xQueueReceive(relay_command_queue, &command, 0) == pdTRUE)
+            relay_accept_command(&command);
+
+        TickType_t now = xTaskGetTickCount();
+        bool fresh = relay_last_command != 0 &&
+            (now - relay_last_command) <= pdMS_TO_TICKS(RELAY_COMMAND_TIMEOUT_MS);
+        if (!fresh) {
+            relay_faults |= RELAY_FAULT_TIMEOUT;
+            relay_requested = false;
+            relay_set_output(false);
+        } else if (relay_requested && relay_faults == 0 && !relay_output_on) {
+            relay_set_output(true);
+        }
+
+        if (relay_output_on &&
+            (now - relay_energized_at) >= pdMS_TO_TICKS(RELAY_FEEDBACK_SETTLE_MS) &&
+            !relay_feedback_closed()) {
+            relay_faults |= RELAY_FAULT_FEEDBACK;
+            relay_set_output(false);
+        }
+
+        if ((now - last_status) >= pdMS_TO_TICKS(RELAY_STATUS_PERIOD_MS)) {
+            (void)can_send_relay_status();
+            last_status = now;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 
@@ -497,6 +682,11 @@ static void can_init(void)
             &can_node
         )
     );
+
+    twai_event_callbacks_t callbacks = {
+        .on_rx_done = relay_can_rx_callback,
+    };
+    ESP_ERROR_CHECK(twai_node_register_event_callbacks(can_node, &callbacks, NULL));
 
 
     ESP_ERROR_CHECK(
@@ -805,6 +995,9 @@ void app_main(void)
     );
 
 
+    /* The relay driver is held OFF before any communications start. */
+    relay_init();
+
     /* --------------------------------------------------------
      * Initialize I2C
      * -------------------------------------------------------- */
@@ -818,6 +1011,9 @@ void app_main(void)
      * -------------------------------------------------------- */
 
     can_init();
+
+    if (xTaskCreate(relay_control_task, "relay_control", 3072, NULL, 9, NULL) != pdPASS)
+        abort();
 
 
     int16_t raw = 0;

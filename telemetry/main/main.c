@@ -15,7 +15,7 @@
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 
-/* Transparent bridge: Master IDs 0x500-0x509 -> RYLR993 -> Pilot. */
+/* Telemetry bridge plus a narrow, validated relay-command return path. */
 #define TAG "LOOPMIT_TELEMETRY"
 #define CAN_TX_GPIO GPIO_NUM_5
 #define CAN_RX_GPIO GPIO_NUM_4
@@ -23,7 +23,10 @@
 #define CAN_QUEUE_LEN 64
 #define CAN_DLEN 8
 #define TLM_ID_MIN 0x500
-#define TLM_ID_MAX 0x509
+#define TLM_ID_MAX 0x50A
+#define RELAY_COMMAND_CAN_ID 0x600
+#define RELAY_COMMAND_MAGIC 0xA5
+#define RELAY_COMMAND_TRAILER 0x5A
 #define LORA_UART UART_NUM_2
 #define LORA_TX_GPIO GPIO_NUM_17
 #define LORA_RX_GPIO GPIO_NUM_16
@@ -44,6 +47,8 @@ static QueueHandle_t can_queue;
 static twai_node_handle_t can_node;
 static volatile uint32_t can_rx_count, can_queue_drops;
 static uint32_t radio_seq, radio_ok, radio_fail;
+static uint16_t last_relay_sequence;
+static bool have_relay_sequence;
 
 static bool is_master_telemetry_id(uint32_t id)
 {
@@ -59,6 +64,23 @@ static uint16_t crc16_ccitt_false(const uint8_t *p, size_t n)
             crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
     }
     return crc;
+}
+
+static uint8_t relay_command_checksum(const uint8_t data[8])
+{
+    uint8_t checksum = 0;
+    for (int i = 0; i < 6; ++i) checksum ^= data[i];
+    return checksum;
+}
+
+static bool parse_u32(const char *text, int base, uint32_t *value)
+{
+    if (text == NULL || *text == '\0') return false;
+    char *end = NULL;
+    unsigned long parsed = strtoul(text, &end, base);
+    if (end == text || *end != '\0' || parsed > UINT32_MAX) return false;
+    *value = (uint32_t)parsed;
+    return true;
 }
 
 static void bytes_to_hex(char *out, const uint8_t *data, size_t n)
@@ -110,14 +132,13 @@ static void can_init(void)
         .io_cfg.tx = CAN_TX_GPIO,
         .io_cfg.rx = CAN_RX_GPIO,
         .bit_timing.bitrate = CAN_BITRATE,
-        .tx_queue_depth = 1,
-        .flags.enable_listen_only = 1,
+        .tx_queue_depth = 4,
     };
     ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &can_node));
     twai_event_callbacks_t cb = {.on_rx_done = can_rx_callback};
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(can_node, &cb, NULL));
     ESP_ERROR_CHECK(twai_node_enable(can_node));
-    ESP_LOGI(TAG, "CAN listen-only: %d bps, TX=%d RX=%d, Master IDs 0x500-0x509",
+    ESP_LOGI(TAG, "CAN bridge: %d bps, TX=%d RX=%d, Master IDs 0x500-0x50A",
              CAN_BITRATE, CAN_TX_GPIO, CAN_RX_GPIO);
 }
 
@@ -137,30 +158,74 @@ static void lora_uart_init(void)
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 }
 
-/* Read a complete CR/LF-terminated response line; do not assume one UART read is complete. */
-static int read_response(char *out, size_t cap, TickType_t timeout)
+/* GUI/Pilot command: LC1,<sequence>,<0|1>*<CRC16>. Only LoRa source 2 is accepted. */
+static void forward_relay_command(uint16_t sequence, uint8_t requested_state)
 {
-    if (cap < 2) return -1;
-    size_t n = 0;
-    TickType_t start = xTaskGetTickCount();
-    while ((xTaskGetTickCount() - start) < timeout) {
+    uint8_t data[8] = {RELAY_COMMAND_MAGIC, requested_state, 0, 0, 'G', 'U', 0,
+                       RELAY_COMMAND_TRAILER};
+    data[2] = (uint8_t)(sequence >> 8);
+    data[3] = (uint8_t)sequence;
+    data[6] = relay_command_checksum(data);
+    twai_frame_t frame = {.header.id = RELAY_COMMAND_CAN_ID, .header.ide = false,
+                          .buffer = data, .buffer_len = sizeof(data)};
+    if (twai_node_transmit(can_node, &frame, 20) != ESP_OK)
+        ESP_LOGW(TAG, "Relay command could not be forwarded to Master");
+}
+
+static void process_relay_payload(char *payload)
+{
+    char *star = strrchr(payload, '*');
+    uint32_t given = 0, sequence = 0, state = 0;
+    if (!star || strlen(star + 1) != 4 || !parse_u32(star + 1, 16, &given) ||
+        crc16_ccitt_false((const uint8_t *)payload, (size_t)(star - payload)) != (uint16_t)given)
+        return;
+    *star = '\0';
+    char *save = NULL;
+    char *version = strtok_r(payload, ",", &save);
+    if (!version || strcmp(version, "LC1") != 0 ||
+        !parse_u32(strtok_r(NULL, ",", &save), 10, &sequence) || sequence > UINT16_MAX ||
+        !parse_u32(strtok_r(NULL, ",", &save), 10, &state) || state > 1 ||
+        strtok_r(NULL, ",", &save) != NULL)
+        return;
+    uint16_t seq16 = (uint16_t)sequence;
+    uint16_t delta = (uint16_t)(seq16 - last_relay_sequence);
+    if (have_relay_sequence && (delta == 0 || delta >= 0x8000))
+        return;
+    have_relay_sequence = true;
+    last_relay_sequence = seq16;
+    forward_relay_command(seq16, (uint8_t)state);
+}
+
+/* RYLR receive form: +RCV=<source>,<length>,<payload>,<rssi>,<snr>. */
+static void lora_command_receive_task(void *arg)
+{
+    (void)arg;
+    char line[PAYLOAD_MAX + 80];
+    size_t used = 0;
+    while (1) {
         uint8_t ch;
-        int got = uart_read_bytes(LORA_UART, &ch, 1, pdMS_TO_TICKS(10));
-        if (got <= 0) continue;
+        if (uart_read_bytes(LORA_UART, &ch, 1, pdMS_TO_TICKS(100)) <= 0)
+            continue;
         if (ch == '\r') continue;
-        if (ch == '\n') {
-            if (!n) continue;
-            out[n] = '\0';
-            return (int)n;
-        }
-        if (n < cap - 1) out[n++] = (char)ch;
-        else {
-            out[n] = '\0';
-            return -1;
-        }
+        if (ch != '\n' && used < sizeof(line) - 1) { line[used++] = (char)ch; continue; }
+        line[used] = '\0'; used = 0;
+        if (strncmp(line, "+RCV=", 5) != 0) continue;
+        char *source = line + 5;
+        char *comma1 = strchr(source, ',');
+        if (!comma1) continue;
+        *comma1 = '\0';
+        char *length = comma1 + 1;
+        char *comma2 = strchr(length, ',');
+        if (!comma2) continue;
+        *comma2 = '\0';
+        char *payload = comma2 + 1;
+        uint32_t src = 0, declared = 0;
+        if (!parse_u32(source, 10, &src) || !parse_u32(length, 10, &declared) ||
+            src != PILOT_ADDRESS || declared == 0 || declared >= sizeof(line)) continue;
+        if (payload[declared] != ',') continue;
+        payload[declared] = '\0';
+        process_relay_payload(payload);
     }
-    out[n] = '\0';
-    return n ? (int)n : 0;
 }
 
 /* LM1,SEQ,COUNT,CAN_ID,LENGTH,DATA_HEX[,CAN_ID,LENGTH,DATA_HEX...]*CRC */
@@ -208,8 +273,6 @@ static bool send_batch(const can_msg_t *msgs, unsigned count)
         return false;
     }
 
-    /* The module is used only for TX on this node; discard stale response bytes before command. */
-    uart_flush_input(LORA_UART);
     int sent = uart_write_bytes(LORA_UART, cmd, (size_t)clen);
     if (sent != clen) {
         radio_fail++;
@@ -218,16 +281,10 @@ static bool send_batch(const can_msg_t *msgs, unsigned count)
     }
     (void)uart_wait_tx_done(LORA_UART, pdMS_TO_TICKS(150));
 
-    char response[128];
-    int nr = read_response(response, sizeof(response), pdMS_TO_TICKS(RADIO_TIMEOUT_MS));
-    bool ok = nr > 0 && (strstr(response, "+OK") != NULL || strcmp(response, "OK") == 0);
-    if (ok) radio_ok++;
-    else {
-        radio_fail++;
-        ESP_LOGW(TAG, "RYLR response: %s", nr > 0 ? response : (nr < 0 ? "line too long" : "timeout"));
-    }
-    ESP_LOGI(TAG, "LoRa seq=%" PRIu32 " frames=%u accepted=%d", radio_seq, count, ok);
-    return ok;
+    /* UART RX is owned by the command task so incoming GUI commands are never lost. */
+    radio_ok++;
+    ESP_LOGI(TAG, "LoRa seq=%" PRIu32 " frames=%u queued", radio_seq, count);
+    return true;
 }
 
 static void telemetry_task(void *arg)
@@ -254,8 +311,10 @@ void app_main(void)
 {
     lora_uart_init();
     can_init();
+    if (xTaskCreate(lora_command_receive_task, "lora_command_rx", 4096, NULL, 9, NULL) != pdPASS)
+        abort();
     ESP_LOGW(TAG, "Pod RYLR993 address=1; Pilot address=2; band=865 MHz; match radio parameters");
     if (xTaskCreate(telemetry_task, "telemetry_task", 6144, NULL, 8, NULL) != pdPASS)
         abort();
-    ESP_LOGI(TAG, "Ready: forwarding only Master telemetry IDs 0x500-0x509");
+    ESP_LOGI(TAG, "Ready: telemetry 0x500-0x50A and validated relay commands from LoRa source %d", PILOT_ADDRESS);
 }

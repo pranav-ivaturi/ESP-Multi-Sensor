@@ -11,6 +11,7 @@ The node performs:
 3. VL53L4CD LiDAR I²C interface
 4. CAN/TWAI initialization
 5. Periodic CAN transmission
+6. Fail-safe relay-driver control from validated Master keepalives
 
 Slave 2 is part of the **ESP Multi Sensor** distributed Master–Slave CAN architecture.
 
@@ -95,6 +96,15 @@ V_INPUT = V_ADC × 1.5
 
 The maximum theoretical input corresponding to the ADS1113's ±2.048 V range is approximately 3.072 V with this divider.
 
+### Relay driver and feedback
+
+| Signal | ESP32 pin | Requirement |
+|---|---|---|
+| Relay driver input | GPIO 25 | Connect only to an external transistor/MOSFET or optocoupled driver. Do **not** connect an ESP32 pin to a coil. |
+| Auxiliary contact feedback | GPIO 26 | Isolated 3.3 V-compatible NO auxiliary-contact signal; high means relay closed. |
+
+The relay coil uses the external power supply. A flyback diode or equivalent suppression belongs at the coil/driver. The firmware starts and resets OFF, opens on a 750 ms command timeout, and opens/latches a fault if feedback does not confirm closure within 500 ms. An explicit OFF command is required to clear a fault.
+
 ---
 
 # CAN Communication
@@ -126,7 +136,7 @@ Use **120 Ω termination at both physical ends of the CAN bus**.
 | Parameter | Value |
 |---|---|
 | CAN bitrate | **500 kbit/s** |
-| CAN IDs | **0x200** (ADS1113), **0x201** (LiDAR) |
+| CAN IDs | **0x200** (ADS1113), **0x201** (LiDAR), **0x202** (relay status), receives **0x610** (relay command) |
 | Frame type | Standard 11-bit |
 | Data length | 8 bytes |
 | Encoding | **Big-endian** |
@@ -174,6 +184,10 @@ This was changed from the original little-endian implementation so that Slave 2 
 | 5–7 | Reserved | — |
 
 The VL53L4CD hardware interface has moved from Slave 4. Slave 2 validates the module identity during startup, runs continuous ranging, and transmits each valid millimetre measurement. It sends `-1` with status `0x00` if the module is absent, a measurement times out, or the sensor reports an invalid range result.
+
+## Relay CAN protocol
+
+Master sends `0x610` every 250 ms. Payload: `A5,STATE,SEQ_H,SEQ_L,'M','2',XOR,5A`, where `STATE` is `0` (open) or `1` (energize). Slave 2 rejects malformed/stale commands and reports `0x202`: byte 0 state flags (requested, output, feedback, fresh command, fault), byte 1 fault flags (`0x01` timeout, `0x02` feedback, `0x04` invalid command), bytes 2–3 sequence, bytes 4–5 command age in ms.
 
 ---
 

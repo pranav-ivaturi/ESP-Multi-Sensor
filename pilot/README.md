@@ -23,7 +23,7 @@ The firmware processes incoming LoRa packets, validates their integrity using CR
 | RX GPIO | GPIO 16 |
 | Baud rate | 9600 |
 | Pilot address | 2 |
-| Telemetry CAN ID range | 0x500–0x509 |
+| Telemetry CAN ID range | 0x500–0x50A |
 | Maximum radio payload | 240 bytes |
 | Radio response timeout | 150 ms |
 | Telemetry batch size | 4 |
@@ -64,7 +64,7 @@ Uses CRC16 validation to verify received packet integrity and identify corrupted
 
 ### 4. Telemetry Parsing
 
-Extracts telemetry messages associated with CAN IDs ranging from `0x500` to `0x509` and processes the received data.
+Extracts telemetry messages associated with CAN IDs ranging from `0x500` to `0x50A` and processes the received data, including Slave 2 relay status.
 
 ### 5. JSON Output
 
@@ -73,6 +73,10 @@ Formats processed telemetry and communication information into JSON output for s
 ### 6. Communication Statistics
 
 Reports link and reception statistics to help monitor the pilot-side wireless communication system.
+
+### 7. Relay GUI bridge
+
+The USB-serial GUI sends `RELAY,1` / `RELAY,ON` or `RELAY,0` / `RELAY,OFF`. The Pilot sends CRC-protected LoRa keepalives (`LC1,SEQ,STATE*CRC`) every 250 ms, but an ON command expires after 1 second unless the GUI continues to refresh it. It prints `relay_status` JSON from CAN ID `0x50A`; treat a requested ON state as successful only when `output_on` and `feedback_closed` are both true and `faults` is zero.
 
 ## Building the Project
 

@@ -15,10 +15,11 @@ The firmware runs on an ESP32-WROOM-32 DevKit using ESP-IDF and FreeRTOS.
 - Prints decoded sensor data to the serial monitor.
 - Tracks slave communication using receive timestamps.
 - Detects ONLINE and OFFLINE communication states.
-- Republishes recognized slave frames using Master telemetry IDs `0x500–0x509`.
+- Republishes recognized slave frames using Master telemetry IDs `0x500–0x50A`.
 - Tracks successful and failed Master telemetry transmissions.
+- Validates sequenced relay keepalives from Telemetry and forwards them to Slave 2 every 250 ms.
 
-**Hardware control and command transmission to slaves are not implemented.**
+Relay control defaults OFF when GUI/Telemetry keepalives stop. It is not a replacement for independent hardware safety interlocks.
 
 ---
 
@@ -91,7 +92,7 @@ The ESP32 contains an integrated TWAI controller but requires an external physic
                      +-------------+
                             |
                  Master CAN IDs
-                    0x500–0x509
+                    0x500–0x50A
                             |
                      +-------------+
                      | TELEMETRY  |
@@ -135,6 +136,7 @@ All currently supported slave frames use:
 | Slave 1 | `0x102` | Temperatures, Hall digital output, RTD faults, status |
 | Slave 2 | `0x200` | ADC raw value, voltages, packet counter |
 | Slave 2 | `0x201` | LiDAR distance, status, packet counter |
+| Slave 2 | `0x202` | Relay requested/output/feedback state and fault flags |
 | Slave 3 | `0x300` | Two IR sensors' ambient and object temperatures |
 | Slave 3 | `0x301` | LiDAR distance, pressure, sequence |
 | Slave 3 | `0x302` | Sensor status flags |
@@ -152,6 +154,7 @@ The Master maps the original slave CAN identifiers to its own telemetry identifi
 | `0x102` | `0x502` |
 | `0x200` | `0x503` |
 | `0x201` | `0x509` |
+| `0x202` | `0x50A` |
 | `0x300` | `0x504` |
 | `0x301` | `0x505` |
 | `0x302` | `0x506` |

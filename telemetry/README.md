@@ -4,7 +4,7 @@
 
 The Telemetry module is a dedicated CAN-to-LoRa communication bridge within the ESP Multi Sensor project.
 
-It receives sensor data frames retransmitted by the Master over the CAN bus, packages them into structured telemetry batches, and forwards them wirelessly through the RYLR993 LoRa module to the Pilot receiver.
+It receives sensor data frames retransmitted by the Master over the CAN bus, packages them into structured telemetry batches, and forwards them wirelessly through the RYLR993 LoRa module to the Pilot receiver. It also accepts one strictly validated relay-control keepalive path in the reverse direction.
 
 The module operates independently from the Master and Slave firmware, providing a dedicated communication interface for external sensor data monitoring.
 
@@ -32,7 +32,7 @@ The module operates independently from the Master and Slave firmware, providing 
 | CAN TX | GPIO 5 |
 | CAN RX | GPIO 4 |
 
-The CAN interface operates in **listen-only mode** and does not transmit frames onto the CAN bus.
+The CAN interface publishes validated relay commands (`0x600`) to Master; all other command IDs are rejected.
 
 ### RYLR993 — UART2
 
@@ -62,7 +62,7 @@ Slave 1 ──┐
 Slave 2 ──┤
 Slave 3 ──┼── CAN Bus ── Master
 Slave 4 ──┘                  │
-                             │ IDs 0x500–0x509
+                             │ IDs 0x500–0x50A
                              ▼
                       CAN Bus (Listen-Only)
                              │
@@ -96,6 +96,7 @@ The Telemetry ESP32 accepts only the following Master-generated telemetry frames
 | `0x502` | Slave 1 — Temperature / Status |
 | `0x503` | Slave 2 — ADC |
 | `0x509` | Slave 2 — LiDAR |
+| `0x50A` | Slave 2 — relay status |
 | `0x504` | Slave 3 — Temperature |
 | `0x505` | Slave 3 — Distance / Pressure |
 | `0x506` | Slave 3 — Status |
@@ -131,6 +132,10 @@ LM1,1,2,500,8,0010002000300040,501,8,0040005000600070*CRC
 ```
 
 The CRC is calculated over the packet contents preceding the `*` separator.
+
+## Relay command return protocol
+
+Telemetry accepts only LoRa packets from Pilot address `2` in this format: `LC1,SEQ,STATE*CRC`, where `STATE` is `0` or `1` and `CRC` is CRC-16/CCITT-FALSE over the text before `*`. It rejects bad CRCs, malformed packets, and stale/duplicate sequences. A validated command is forwarded on CAN as `0x600`; Master independently requires continuing keepalives and sends `0x610` to Slave 2. Loss of this path opens the relay.
 
 ### Batching Configuration
 
@@ -194,7 +199,7 @@ idf.py build
 - [x] ESP32 target configured
 - [x] ESP-IDF project structure established
 - [x] CAN/TWAI initialization implemented
-- [x] CAN listen-only mode configured
+- [x] CAN telemetry bridge and validated relay-command forwarding configured
 - [x] Master telemetry ID filtering implemented
 - [x] CAN receive queue implemented
 - [x] CAN frame batching implemented
